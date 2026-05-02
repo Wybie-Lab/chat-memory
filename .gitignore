@@ -1,0 +1,10 @@
+node_modules/
+dist/
+data/
+.env
+.env.local
+config/whitelist.json
+.wwebjs_cache/
+*.log
+.DS_Store
+.context/

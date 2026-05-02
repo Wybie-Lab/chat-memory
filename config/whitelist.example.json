@@ -1,0 +1,15 @@
+{
+  "contacts": [
+    {
+      "wa_id": "393331234567@c.us",
+      "display_name": "Mom",
+      "notes": "primary use case — remember her doctor appointments, family events"
+    },
+    {
+      "wa_id": "393339876543@c.us",
+      "display_name": "Marco",
+      "notes": "best friend, talks about travel plans a lot"
+    }
+  ],
+  "groups": []
+}
