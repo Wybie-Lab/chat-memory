@@ -69,6 +69,81 @@
     .citation-id { color: var(--accent); font-weight: 600; margin-right: 8px; }
     .citation-content { color: var(--fg); }
     .citation-source { display: block; margin-top: 4px; font-style: italic; color: var(--muted); font-size: 11px; }
+
+    /* MEMORY DEBUG PANEL */
+    .memory-debug {
+      margin-top: 6px; font-size: 12px;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 6px; overflow: hidden;
+    }
+    .memory-debug summary {
+      padding: 8px 12px; cursor: pointer; color: var(--muted);
+      list-style: none; user-select: none;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .memory-debug summary::-webkit-details-marker { display: none; }
+    .memory-debug summary::before {
+      content: '▸'; color: var(--muted); transition: transform 0.15s;
+    }
+    .memory-debug[open] summary::before { transform: rotate(90deg); }
+    .memory-debug summary:hover { background: var(--panel-2); }
+    .memory-debug summary .label { color: var(--accent); font-weight: 600; }
+    .memory-debug summary .meta {
+      color: var(--muted); margin-left: auto; font-variant-numeric: tabular-nums;
+    }
+    .memory-body { padding: 8px 12px 12px; border-top: 1px solid var(--border); }
+    .memory-section { margin-top: 12px; }
+    .memory-section:first-child { margin-top: 0; }
+    .memory-section h4 {
+      margin: 0 0 6px; font-size: 11px; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;
+    }
+    .memory-list {
+      margin: 0; padding: 0; list-style: none;
+      display: flex; flex-direction: column; gap: 4px;
+    }
+    .memory-list li {
+      padding: 6px 8px; background: var(--panel-2);
+      border-radius: 4px; color: var(--fg);
+    }
+    .memory-list li .meta-tag {
+      color: var(--muted); font-size: 11px; margin-right: 6px;
+    }
+    .memory-list li .fact-ref {
+      color: var(--accent); font-size: 11px; margin-left: 6px;
+    }
+    .pill-row {
+      display: flex; flex-wrap: wrap; gap: 4px;
+    }
+    .pill {
+      padding: 2px 8px; background: var(--panel-2);
+      border: 1px solid var(--border); border-radius: 99px;
+      color: var(--fg); font-size: 11px;
+    }
+    .budget-bar {
+      display: flex; height: 6px; border-radius: 3px; overflow: hidden;
+      background: var(--panel-2); margin-top: 4px;
+    }
+    .budget-bar > span { display: block; }
+    .budget-bar .b-prefs { background: #6ad0aa; }
+    .budget-bar .b-facts { background: #4a90e2; }
+    .budget-bar .b-clusters { background: #f0a832; }
+    .budget-bar .b-episodes { background: #c084fc; }
+    .budget-legend {
+      display: flex; gap: 12px; margin-top: 6px;
+      color: var(--muted); font-size: 11px;
+    }
+    .budget-legend .swatch {
+      display: inline-block; width: 8px; height: 8px;
+      border-radius: 2px; margin-right: 4px; vertical-align: middle;
+    }
+    .memory-raw {
+      margin: 0; padding: 8px; background: var(--bg);
+      border-radius: 4px; color: var(--fg); font-size: 11px;
+      font-family: "SF Mono", ui-monospace, monospace;
+      white-space: pre-wrap; word-wrap: break-word;
+      max-height: 280px; overflow-y: auto;
+    }
     .empty {
       text-align: center; color: var(--muted); padding: 64px 24px;
       font-size: 13px;
@@ -227,8 +302,8 @@
       <h2>Import a WhatsApp chat export</h2>
       <p class="help">
         On your phone: WhatsApp → open the chat → ⋮ / contact name → <em>Export Chat</em> → <em>Without media</em>.
-        Send the resulting <code>_chat.txt</code> to yourself, drop it here, and it'll be parsed and ingested.
-        Run <code>npm run process</code> after to extract facts.
+        Send the resulting <code>_chat.txt</code> to yourself, then drop it here.
+        The contact's wa_id is derived from the phone number; the display name is auto-detected from the export.
       </p>
       <form id="import-form">
         <div class="field">
@@ -237,16 +312,19 @@
           <span class="hint" id="import-file-info"></span>
         </div>
         <div class="field">
-          <label for="import-wa-id">Contact (from whitelist)</label>
-          <select id="import-wa-id" required>
-            <option value="">Loading…</option>
-          </select>
-          <span class="hint">Edit <code>config/whitelist.json</code> to add contacts. Restart not required — the list reloads on each request.</span>
+          <label for="import-phone">Contact phone number</label>
+          <input type="text" id="import-phone" required placeholder="+39 333 123 4567" autocomplete="off" />
+          <span class="hint" id="import-phone-info">Country code + number. Spaces, dashes, and "+" are fine. Will be auto-added to the whitelist.</span>
         </div>
         <div class="field">
           <label for="import-me">Your display name in the export</label>
           <input type="text" id="import-me" required placeholder="your name as it appears in the export" autocomplete="off" />
           <span class="hint">Must match exactly how your name appears as the sender in the .txt file (case-sensitive).</span>
+        </div>
+        <div class="field">
+          <label for="import-display-name">Contact display name (optional)</label>
+          <input type="text" id="import-display-name" placeholder="auto-detected from the file if blank" autocomplete="off" />
+          <span class="hint">If left blank, the most-frequent non-"me" sender in the file becomes the contact's name.</span>
         </div>
         <button type="submit" id="import-submit">Import</button>
       </form>
@@ -274,7 +352,7 @@
     const input = $('#question');
     const sendBtn = form.querySelector('button');
 
-    function renderMsg(role, text, citations) {
+    function renderMsg(role, text, citations, memoryDebug) {
       const empty = messagesEl.querySelector('.empty');
       if (empty) empty.remove();
 
@@ -306,9 +384,163 @@
         wrap.appendChild(cWrap);
       }
 
+      if (memoryDebug) {
+        wrap.appendChild(renderMemoryDebug(memoryDebug));
+      }
+
       messagesEl.appendChild(wrap);
       messagesEl.scrollTop = messagesEl.scrollHeight;
       return wrap;
+    }
+
+    function renderMemoryDebug(d) {
+      const details = document.createElement('details');
+      details.className = 'memory-debug';
+
+      const summary = document.createElement('summary');
+      const totalChars = d.budget?.total_chars ?? 0;
+      const summaryParts = [
+        `${d.preferences?.length || 0} pref`,
+        `${d.cluster_summaries?.length || 0} cluster`,
+        `${d.episodes?.length || 0} episode`,
+        `${d.citations?.length || 0} fact`,
+      ];
+      summary.innerHTML = `
+        <span class="label">memory</span>
+        <span class="meta-text"></span>
+        <span class="meta"></span>
+      `;
+      summary.querySelector('.meta-text').textContent = summaryParts.join(' · ');
+      summary.querySelector('.meta').textContent = `${totalChars} chars`;
+      details.appendChild(summary);
+
+      const body = document.createElement('div');
+      body.className = 'memory-body';
+
+      // Matched subjects
+      if (d.matched_subjects && d.matched_subjects.length) {
+        body.appendChild(makeSection('matched subjects', () => {
+          const row = document.createElement('div');
+          row.className = 'pill-row';
+          for (const s of d.matched_subjects) {
+            const p = document.createElement('span');
+            p.className = 'pill';
+            p.textContent = s;
+            row.appendChild(p);
+          }
+          return row;
+        }));
+      }
+
+      // Budget bar
+      if (d.budget && d.budget.sections) {
+        body.appendChild(makeSection('token budget', () => {
+          const wrap = document.createElement('div');
+          const sections = d.budget.sections;
+          const totals = (sections.preferences?.used_chars || 0)
+            + (sections.top_facts?.used_chars || 0)
+            + (sections.cluster_summaries?.used_chars || 0)
+            + (sections.recent_episodes?.used_chars || 0);
+          const max = Math.max(totals, 1);
+          const pct = (n) => (100 * n / max) + '%';
+          const bar = document.createElement('div');
+          bar.className = 'budget-bar';
+          bar.innerHTML = `
+            <span class="b-prefs"     style="width:${pct(sections.preferences?.used_chars || 0)}"></span>
+            <span class="b-facts"     style="width:${pct(sections.top_facts?.used_chars || 0)}"></span>
+            <span class="b-clusters"  style="width:${pct(sections.cluster_summaries?.used_chars || 0)}"></span>
+            <span class="b-episodes"  style="width:${pct(sections.recent_episodes?.used_chars || 0)}"></span>
+          `;
+          wrap.appendChild(bar);
+          const legend = document.createElement('div');
+          legend.className = 'budget-legend';
+          legend.innerHTML = `
+            <span><i class="swatch" style="background:#6ad0aa"></i>prefs ${sections.preferences?.used_chars || 0}c (${sections.preferences?.dropped || 0} dropped)</span>
+            <span><i class="swatch" style="background:#4a90e2"></i>facts ${sections.top_facts?.used_chars || 0}c (${sections.top_facts?.dropped || 0} dropped)</span>
+            <span><i class="swatch" style="background:#f0a832"></i>clusters ${sections.cluster_summaries?.used_chars || 0}c (${sections.cluster_summaries?.dropped || 0} dropped)</span>
+            <span><i class="swatch" style="background:#c084fc"></i>episodes ${sections.recent_episodes?.used_chars || 0}c (${sections.recent_episodes?.dropped || 0} dropped)</span>
+          `;
+          wrap.appendChild(legend);
+          return wrap;
+        }));
+      }
+
+      // Preferences
+      if (d.preferences && d.preferences.length) {
+        body.appendChild(makeSection('preferences (always-on)', () => {
+          return makeFactList(d.preferences, (p) => ({
+            tag: p.subject_wa_id,
+            text: p.content,
+            ref: `[fact:${p.id}]`,
+          }));
+        }));
+      }
+
+      // Cluster summaries
+      if (d.cluster_summaries && d.cluster_summaries.length) {
+        body.appendChild(makeSection('subject summaries', () => {
+          return makeFactList(d.cluster_summaries, (c) => ({
+            tag: `${c.subject_wa_id} · ${c.category}`,
+            text: c.summary,
+            ref: `(${c.fact_count} facts)`,
+          }));
+        }));
+      }
+
+      // Episodes
+      if (d.episodes && d.episodes.length) {
+        body.appendChild(makeSection('recent episodes', () => {
+          return makeFactList(d.episodes, (e) => ({
+            tag: `${e.subject_wa_id} · ${e.category}`,
+            text: e.content,
+            ref: `[fact:${e.id}]`,
+          }));
+        }));
+      }
+
+      // Raw memory block
+      if (d.memory_block) {
+        body.appendChild(makeSection('raw <memory> block (sent to model)', () => {
+          const pre = document.createElement('pre');
+          pre.className = 'memory-raw';
+          pre.textContent = d.memory_block;
+          return pre;
+        }));
+      }
+
+      details.appendChild(body);
+      return details;
+    }
+
+    function makeSection(title, contentFn) {
+      const sec = document.createElement('div');
+      sec.className = 'memory-section';
+      const h = document.createElement('h4');
+      h.textContent = title;
+      sec.appendChild(h);
+      sec.appendChild(contentFn());
+      return sec;
+    }
+
+    function makeFactList(items, project) {
+      const ul = document.createElement('ul');
+      ul.className = 'memory-list';
+      for (const item of items) {
+        const { tag, text, ref } = project(item);
+        const li = document.createElement('li');
+        const tagSpan = document.createElement('span');
+        tagSpan.className = 'meta-tag';
+        tagSpan.textContent = tag;
+        const textNode = document.createTextNode(text);
+        const refSpan = document.createElement('span');
+        refSpan.className = 'fact-ref';
+        refSpan.textContent = ref;
+        li.appendChild(tagSpan);
+        li.appendChild(textNode);
+        li.appendChild(refSpan);
+        ul.appendChild(li);
+      }
+      return ul;
     }
 
     form.addEventListener('submit', async (e) => {
@@ -331,7 +563,15 @@
         const data = await r.json();
         typing.remove();
         if (!r.ok) throw new Error(data.error || 'request failed');
-        renderMsg('assistant', data.answer || '(empty answer)', data.citations);
+        renderMsg('assistant', data.answer || '(empty answer)', data.citations, {
+          preferences: data.preferences,
+          cluster_summaries: data.cluster_summaries,
+          episodes: data.episodes,
+          matched_subjects: data.matched_subjects,
+          memory_block: data.memory_block,
+          budget: data.budget,
+          citations: data.citations,
+        });
       } catch (err) {
         typing.remove();
         renderMsg('error', err.message);
@@ -429,50 +669,33 @@
     const importForm = $('#import-form');
     const importFile = $('#import-file');
     const importFileInfo = $('#import-file-info');
-    const importWaSelect = $('#import-wa-id');
+    const importPhone = $('#import-phone');
+    const importPhoneInfo = $('#import-phone-info');
     const importMe = $('#import-me');
+    const importDisplayName = $('#import-display-name');
     const importSubmit = $('#import-submit');
     const importResult = $('#import-result');
 
-    let whitelistLoaded = false;
-
-    async function loadWhitelistOptions() {
-      if (whitelistLoaded) return;
-      try {
-        const r = await fetch('/api/whitelist');
-        const data = await r.json();
-        if (!r.ok) throw new Error(data.error || 'failed to load whitelist');
-        importWaSelect.innerHTML = '';
-        if (!data.entries || data.entries.length === 0) {
-          const opt = document.createElement('option');
-          opt.value = '';
-          opt.textContent = '(whitelist is empty — add an entry to config/whitelist.json)';
-          opt.disabled = true;
-          opt.selected = true;
-          importWaSelect.appendChild(opt);
-          return;
-        }
-        const placeholder = document.createElement('option');
-        placeholder.value = '';
-        placeholder.textContent = 'Select a contact…';
-        placeholder.disabled = true;
-        placeholder.selected = true;
-        importWaSelect.appendChild(placeholder);
-        for (const e of data.entries) {
-          const opt = document.createElement('option');
-          opt.value = e.wa_id;
-          opt.textContent = e.display_name ? `${e.display_name} (${e.wa_id})` : e.wa_id;
-          importWaSelect.appendChild(opt);
-        }
-        whitelistLoaded = true;
-      } catch (err) {
-        importWaSelect.innerHTML = `<option value="" disabled selected>error: ${escapeHtml(err.message)}</option>`;
-      }
-    }
+    // No-op kept so the nav-button hook in the view switcher doesn't error.
+    function loadWhitelistOptions() {}
 
     importFile.addEventListener('change', () => {
       const f = importFile.files && importFile.files[0];
       importFileInfo.textContent = f ? `${f.name} — ${(f.size / 1024).toFixed(1)} KB` : '';
+    });
+
+    // Live preview of the derived wa_id as the user types.
+    importPhone.addEventListener('input', () => {
+      const digits = importPhone.value.replace(/\D+/g, '');
+      if (!digits) {
+        importPhoneInfo.textContent = 'Country code + number. Spaces, dashes, and "+" are fine. Will be auto-added to the whitelist.';
+        return;
+      }
+      if (digits.length < 6) {
+        importPhoneInfo.textContent = `${digits.length} digit(s) — too short, keep typing.`;
+        return;
+      }
+      importPhoneInfo.textContent = `→ wa_id: ${digits}@c.us`;
     });
 
     function readFileText(file) {
@@ -484,7 +707,7 @@
       });
     }
 
-    function showImportResult(success, title, statsOrError) {
+    function showImportResult(success, title, statsOrError, contactMeta) {
       importResult.classList.remove('hidden', 'success', 'error');
       importResult.classList.add(success ? 'success' : 'error');
       if (!success) {
@@ -494,9 +717,23 @@
       }
       const s = statsOrError;
       const cutoff = s.live_cutoff_ts ? new Date(s.live_cutoff_ts * 1000).toLocaleString() : '—';
+      const wlNote =
+        contactMeta?.whitelist?.added
+          ? '✓ added to whitelist'
+          : contactMeta?.whitelist?.updated
+          ? '↺ updated in whitelist'
+          : 'already in whitelist';
+      const nameNote =
+        contactMeta?.display_name
+          ? contactMeta.detected_display_name && contactMeta.display_name === contactMeta.detected_display_name
+            ? `${escapeHtml(contactMeta.display_name)} <em>(auto-detected)</em>`
+            : escapeHtml(contactMeta.display_name)
+          : '<em>—</em>';
       importResult.innerHTML = `
         <h3>${escapeHtml(title)}</h3>
         <dl>
+          <dt>contact</dt><dd>${nameNote}</dd>
+          <dt>wa_id</dt><dd><code>${escapeHtml(contactMeta?.wa_id ?? '')}</code> — ${wlNote}</dd>
           <dt>parsed headers</dt><dd>${s.parse.total}</dd>
           <dt>text messages</dt><dd>${s.parse.text}</dd>
           <dt>media (skipped at burst time)</dt><dd>${s.parse.media}</dd>
@@ -515,9 +752,10 @@
     importForm.addEventListener('submit', async (e) => {
       e.preventDefault();
       const file = importFile.files && importFile.files[0];
-      const waId = importWaSelect.value;
+      const phone = importPhone.value.trim();
       const me = importMe.value.trim();
-      if (!file || !waId || !me) return;
+      const displayName = importDisplayName.value.trim();
+      if (!file || !phone || !me) return;
 
       importSubmit.disabled = true;
       importResult.classList.remove('hidden', 'success', 'error');
@@ -529,14 +767,24 @@
         const r = await fetch('/api/import-chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content, waId, me }),
+          body: JSON.stringify({
+            content,
+            phone,
+            me,
+            displayName: displayName || undefined,
+          }),
         });
         const data = await r.json();
         if (!r.ok) {
           showImportResult(false, 'Import failed', data.error || 'request failed');
           return;
         }
-        showImportResult(true, 'Import complete', data.stats);
+        showImportResult(true, 'Import complete', data.stats, {
+          wa_id: data.wa_id,
+          display_name: data.display_name,
+          detected_display_name: data.detected_display_name,
+          whitelist: data.whitelist,
+        });
       } catch (err) {
         showImportResult(false, 'Import failed', err.message);
       } finally {

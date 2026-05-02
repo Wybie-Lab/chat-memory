@@ -118,6 +118,34 @@ function migrate(db: DB): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_active
            ON facts(subject_wa_id)
            WHERE superseded_by_id IS NULL AND deleted_at IS NULL`);
+
+  backfillFactSources(db);
+}
+
+/**
+ * One-shot backfill: copy every existing fact's primary source into the new
+ * fact_sources table so multi-source reads return correct citations on
+ * pre-multi-source rows. Idempotent — only inserts when fact_sources is empty
+ * relative to the row count of facts that have a source.
+ */
+function backfillFactSources(db: DB): void {
+  const existing = db.prepare('SELECT COUNT(*) AS n FROM fact_sources').get() as { n: number };
+  if (existing.n > 0) return;
+
+  const factsWithSource = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM facts
+       WHERE source_burst_id IS NOT NULL OR source_msg_id IS NOT NULL`
+    )
+    .get() as { n: number };
+  if (factsWithSource.n === 0) return;
+
+  db.exec(`
+    INSERT INTO fact_sources (fact_id, source_burst_id, source_msg_id, attached_at)
+    SELECT id, source_burst_id, source_msg_id, extracted_at
+    FROM facts
+    WHERE source_burst_id IS NOT NULL OR source_msg_id IS NOT NULL
+  `);
 }
 
 function hasColumn(db: DB, table: string, column: string): boolean {
@@ -302,10 +330,18 @@ export function rebuildAllBursts(db: DB): { bursts: number; messages: number } {
 
 /**
  * Bursts whose end_ts is at least BURST_GAP_SECONDS in the past (so we know no
- * more messages can join) and that haven't been processed yet.
+ * more messages can join) and that haven't been processed yet. Pass
+ * `includeUnsettled: true` to bypass the cutoff — useful for the eval
+ * harness where every transcript is finalized at ingest time.
  */
-export function listUnprocessedBursts(db: DB, limit: number): UnprocessedBurst[] {
-  const cutoff = Math.floor(Date.now() / 1000) - BURST_GAP_SECONDS;
+export function listUnprocessedBursts(
+  db: DB,
+  limit: number,
+  opts: { includeUnsettled?: boolean } = {}
+): UnprocessedBurst[] {
+  const cutoff = opts.includeUnsettled
+    ? Math.floor(Date.now() / 1000) + 86400 // far future = include all
+    : Math.floor(Date.now() / 1000) - BURST_GAP_SECONDS;
   const rows = db
     .prepare(
       `SELECT
@@ -382,7 +418,58 @@ export function insertFact(db: DB, fact: FactInput): number {
       fact.confidence,
       now
     );
-  return Number(result.lastInsertRowid);
+  const factId = Number(result.lastInsertRowid);
+
+  if (fact.source_burst_id !== null || (fact.source_msg_id ?? null) !== null) {
+    db.prepare(
+      `INSERT INTO fact_sources (fact_id, source_burst_id, source_msg_id, attached_at)
+       VALUES (?, ?, ?, ?)`
+    ).run(factId, fact.source_burst_id ?? null, fact.source_msg_id ?? null, now);
+  }
+
+  return factId;
+}
+
+/**
+ * Attach an additional supporting source to an existing fact. Used when the
+ * consolidator confirms an existing fact via a new burst — instead of inserting
+ * a duplicate, we record that another piece of evidence backs it. Importance
+ * (used by retrieval scoring) is the count of distinct sources.
+ */
+export function attachFactSource(
+  db: DB,
+  args: { fact_id: number; source_burst_id?: number | null; source_msg_id?: number | null }
+): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO fact_sources (fact_id, source_burst_id, source_msg_id, attached_at)
+     VALUES (?, ?, ?, ?)`
+  ).run(args.fact_id, args.source_burst_id ?? null, args.source_msg_id ?? null, now);
+}
+
+export interface FactSourceRow {
+  fact_id: number;
+  source_burst_id: number | null;
+  source_msg_id: number | null;
+  attached_at: number;
+}
+
+export function getFactSources(db: DB, factId: number): FactSourceRow[] {
+  return db
+    .prepare(
+      `SELECT fact_id, source_burst_id, source_msg_id, attached_at
+       FROM fact_sources
+       WHERE fact_id = ?
+       ORDER BY attached_at ASC`
+    )
+    .all(factId) as FactSourceRow[];
+}
+
+export function countFactSources(db: DB, factId: number): number {
+  const row = db
+    .prepare('SELECT COUNT(*) AS n FROM fact_sources WHERE fact_id = ?')
+    .get(factId) as { n: number };
+  return row.n;
 }
 
 export function insertEmbedding(db: DB, factId: number, vector: number[]): void {
@@ -404,6 +491,29 @@ export interface ActiveFactRow {
   content: string;
   confidence: number;
   extracted_at: number;
+}
+
+/**
+ * Active facts for a single (subject, category) cluster, oldest first so the
+ * summarizer reads them in the order they were learned. Used by the cluster
+ * summary refresh and by retrieval as a typed-view fallback.
+ */
+export function activeFactsForCluster(
+  db: DB,
+  subjectWaId: string,
+  category: string
+): ActiveFactRow[] {
+  return db
+    .prepare(
+      `SELECT id, subject_wa_id, category, content, confidence, extracted_at
+       FROM facts
+       WHERE subject_wa_id = ?
+         AND category = ?
+         AND superseded_by_id IS NULL
+         AND deleted_at IS NULL
+       ORDER BY extracted_at ASC, id ASC`
+    )
+    .all(subjectWaId, category) as ActiveFactRow[];
 }
 
 /**
@@ -551,6 +661,55 @@ export function searchFactsByVector(
     .all(buf, k) as FactSearchResult[];
 }
 
+/**
+ * Vector search restricted to one subject. Used by the consolidator to pick
+ * the most-relevant existing facts to compare against a new candidate, when
+ * the subject has too many active facts to send them all to the LLM.
+ *
+ * The vec0 MATCH pre-filter returns up to `overFetch` global hits ordered by
+ * distance; the JOIN then narrows to the requested subject. If the subject's
+ * facts don't appear in the over-fetched window the result is short or empty
+ * — the caller should fall back to recency-based selection.
+ */
+export function searchFactsForSubjectByVector(
+  db: DB,
+  vector: number[],
+  subjectWaId: string,
+  k: number,
+  overFetch = 200
+): ActiveFactRow[] {
+  const buf = Buffer.from(new Float32Array(vector).buffer);
+  return db
+    .prepare(
+      `SELECT
+         fe.fact_id AS id,
+         f.subject_wa_id, f.category, f.content, f.confidence, f.extracted_at
+       FROM fact_embeddings fe
+       JOIN facts f ON f.id = fe.fact_id
+       WHERE fe.embedding MATCH ?
+         AND k = ?
+         AND f.subject_wa_id = ?
+         AND f.superseded_by_id IS NULL
+         AND f.deleted_at IS NULL
+       ORDER BY fe.distance
+       LIMIT ?`
+    )
+    .all(buf, overFetch, subjectWaId, k) as ActiveFactRow[];
+}
+
+export function countActiveFactsForSubject(db: DB, subjectWaId: string): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n
+       FROM facts
+       WHERE subject_wa_id = ?
+         AND superseded_by_id IS NULL
+         AND deleted_at IS NULL`
+    )
+    .get(subjectWaId) as { n: number };
+  return row.n;
+}
+
 export function listCategories(db: DB): string[] {
   const rows = db
     .prepare('SELECT DISTINCT category FROM facts ORDER BY category')
@@ -583,4 +742,237 @@ export function logProcessing(db: DB, args: ProcessingLogInput): void {
     args.tokens_out,
     now
   );
+}
+
+export interface ClusterSummaryRow {
+  id: number;
+  subject_wa_id: string;
+  category: string;
+  summary: string;
+  fact_count: number;
+  fact_ids: number[];
+  last_refreshed_at: number;
+}
+
+export function upsertClusterSummary(
+  db: DB,
+  args: {
+    subject_wa_id: string;
+    category: string;
+    summary: string;
+    fact_ids: number[];
+  }
+): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO cluster_summaries
+       (subject_wa_id, category, summary, fact_count, fact_ids_json, last_refreshed_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(subject_wa_id, category) DO UPDATE SET
+       summary = excluded.summary,
+       fact_count = excluded.fact_count,
+       fact_ids_json = excluded.fact_ids_json,
+       last_refreshed_at = excluded.last_refreshed_at`
+  ).run(
+    args.subject_wa_id,
+    args.category,
+    args.summary,
+    args.fact_ids.length,
+    JSON.stringify(args.fact_ids),
+    now
+  );
+}
+
+export function deleteClusterSummary(
+  db: DB,
+  subjectWaId: string,
+  category: string
+): void {
+  db.prepare(
+    'DELETE FROM cluster_summaries WHERE subject_wa_id = ? AND category = ?'
+  ).run(subjectWaId, category);
+}
+
+function rowToCluster(r: {
+  id: number;
+  subject_wa_id: string;
+  category: string;
+  summary: string;
+  fact_count: number;
+  fact_ids_json: string;
+  last_refreshed_at: number;
+}): ClusterSummaryRow {
+  return {
+    id: r.id,
+    subject_wa_id: r.subject_wa_id,
+    category: r.category,
+    summary: r.summary,
+    fact_count: r.fact_count,
+    fact_ids: JSON.parse(r.fact_ids_json) as number[],
+    last_refreshed_at: r.last_refreshed_at,
+  };
+}
+
+export function getClusterSummary(
+  db: DB,
+  subjectWaId: string,
+  category: string
+): ClusterSummaryRow | null {
+  const row = db
+    .prepare(
+      `SELECT id, subject_wa_id, category, summary, fact_count, fact_ids_json, last_refreshed_at
+       FROM cluster_summaries
+       WHERE subject_wa_id = ? AND category = ?`
+    )
+    .get(subjectWaId, category) as
+    | {
+        id: number;
+        subject_wa_id: string;
+        category: string;
+        summary: string;
+        fact_count: number;
+        fact_ids_json: string;
+        last_refreshed_at: number;
+      }
+    | undefined;
+  return row ? rowToCluster(row) : null;
+}
+
+export function listClusterSummariesForSubject(
+  db: DB,
+  subjectWaId: string
+): ClusterSummaryRow[] {
+  const rows = db
+    .prepare(
+      `SELECT id, subject_wa_id, category, summary, fact_count, fact_ids_json, last_refreshed_at
+       FROM cluster_summaries
+       WHERE subject_wa_id = ?
+       ORDER BY category`
+    )
+    .all(subjectWaId) as Array<{
+    id: number;
+    subject_wa_id: string;
+    category: string;
+    summary: string;
+    fact_count: number;
+    fact_ids_json: string;
+    last_refreshed_at: number;
+  }>;
+  return rows.map(rowToCluster);
+}
+
+export function listClusterSummariesForSubjects(
+  db: DB,
+  subjectWaIds: string[]
+): ClusterSummaryRow[] {
+  if (subjectWaIds.length === 0) return [];
+  const placeholders = subjectWaIds.map(() => '?').join(',');
+  const rows = db
+    .prepare(
+      `SELECT id, subject_wa_id, category, summary, fact_count, fact_ids_json, last_refreshed_at
+       FROM cluster_summaries
+       WHERE subject_wa_id IN (${placeholders})
+       ORDER BY subject_wa_id, category`
+    )
+    .all(...subjectWaIds) as Array<{
+    id: number;
+    subject_wa_id: string;
+    category: string;
+    summary: string;
+    fact_count: number;
+    fact_ids_json: string;
+    last_refreshed_at: number;
+  }>;
+  return rows.map(rowToCluster);
+}
+
+/**
+ * All active preference-category facts, optionally narrowed to one subject.
+ * Used by composeMemoryBlock as the always-on section: every chat turn includes
+ * preferences regardless of similarity to the question.
+ */
+export function activePreferences(db: DB, subjectWaId?: string): ActiveFactRow[] {
+  const where = ['superseded_by_id IS NULL', 'deleted_at IS NULL', "category = 'preference'"];
+  const params: unknown[] = [];
+  if (subjectWaId) {
+    where.push('subject_wa_id = ?');
+    params.push(subjectWaId);
+  }
+  return db
+    .prepare(
+      `SELECT id, subject_wa_id, category, content, confidence, extracted_at
+       FROM facts
+       WHERE ${where.join(' AND ')}
+       ORDER BY confidence DESC, extracted_at DESC`
+    )
+    .all(...params) as ActiveFactRow[];
+}
+
+/**
+ * Recent episode-shaped facts (event + commitment categories), within the
+ * trailing window of `days`. Episodes whose value is the temporal anchor —
+ * "she's flying to Tokyo next week", "promised to send photos by Friday".
+ */
+export function recentEpisodes(db: DB, days: number): ActiveFactRow[] {
+  const cutoff = Math.floor(Date.now() / 1000) - days * 86400;
+  return db
+    .prepare(
+      `SELECT id, subject_wa_id, category, content, confidence, extracted_at
+       FROM facts
+       WHERE superseded_by_id IS NULL
+         AND deleted_at IS NULL
+         AND category IN ('event', 'commitment')
+         AND extracted_at >= ?
+       ORDER BY extracted_at DESC`
+    )
+    .all(cutoff) as ActiveFactRow[];
+}
+
+export interface SubjectInfo {
+  subject_wa_id: string;
+  display_name: string | null;
+  active_fact_count: number;
+}
+
+/**
+ * All subjects that have at least one active fact, with their contact display
+ * name (if a matching contact exists). Used for entity matching: detect when
+ * the user's question mentions one of these names.
+ */
+export function allActiveSubjects(db: DB): SubjectInfo[] {
+  return db
+    .prepare(
+      `SELECT
+         f.subject_wa_id                   AS subject_wa_id,
+         c.display_name                    AS display_name,
+         COUNT(*)                          AS active_fact_count
+       FROM facts f
+       LEFT JOIN contacts c ON c.wa_id = f.subject_wa_id
+       WHERE f.superseded_by_id IS NULL AND f.deleted_at IS NULL
+       GROUP BY f.subject_wa_id, c.display_name
+       ORDER BY active_fact_count DESC`
+    )
+    .all() as SubjectInfo[];
+}
+
+/**
+ * Active facts about a specific subject. Caps at `limit` (default 100) to keep
+ * retrieval-time payloads bounded; the hybrid scorer filters and trims further.
+ */
+export function factsAboutSubject(
+  db: DB,
+  subjectWaId: string,
+  limit = 100
+): ActiveFactRow[] {
+  return db
+    .prepare(
+      `SELECT id, subject_wa_id, category, content, confidence, extracted_at
+       FROM facts
+       WHERE subject_wa_id = ?
+         AND superseded_by_id IS NULL
+         AND deleted_at IS NULL
+       ORDER BY confidence DESC, extracted_at DESC
+       LIMIT ?`
+    )
+    .all(subjectWaId, limit) as ActiveFactRow[];
 }

@@ -111,7 +111,7 @@ async function main() {
         });
         if (stats.bursts_scanned > 0) {
           console.log(
-            `[pipeline] bursts=${stats.bursts_scanned} kept=${stats.bursts_kept}/dropped=${stats.bursts_dropped} | facts: +${stats.facts_added} updated=${stats.facts_updated} deleted=${stats.facts_deleted} dup=${stats.facts_dropped} guarded=${stats.facts_guarded} | errors=${stats.errors}`
+            `[pipeline] bursts=${stats.bursts_scanned} kept=${stats.bursts_kept}/dropped=${stats.bursts_dropped} | facts: +${stats.facts_added} updated=${stats.facts_updated} deleted=${stats.facts_deleted} dup=${stats.facts_dropped} guarded=${stats.facts_guarded} | clusters: refreshed=${stats.clusters_refreshed} deleted=${stats.clusters_deleted} | errors=${stats.errors}`
           );
         }
         await sleep(stats.bursts_scanned > 0 ? 500 : 5000);

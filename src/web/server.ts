@@ -5,11 +5,17 @@ import {
   openDb,
   listFacts,
   listCategories,
-  searchFactsByVector,
 } from '../memory/db';
 import { createLLMProvider } from '../llm/claude';
-import { loadWhitelist, syncWhitelistToDb } from '../config/whitelist';
+import {
+  loadWhitelist,
+  syncWhitelistToDb,
+  addContactToWhitelistFile,
+} from '../config/whitelist';
 import { importChat } from '../whatsapp/import-chat';
+import { phoneToWaId } from '../whatsapp/phone';
+import { detectOtherSender } from '../whatsapp/parse-export';
+import { composeMemoryBlock } from '../retrieval/memory-block';
 
 const dbPath = process.env.DB_PATH ?? './data/memory.db';
 const whitelistPath = process.env.WHITELIST_PATH ?? './config/whitelist.json';
@@ -54,22 +60,21 @@ app.post('/api/chat', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'question is required' });
     }
 
-    const { vector } = await provider.embed(question, 'query');
-    const matches = searchFactsByVector(db, vector, 10);
-
-    const factsForChat = matches.map((m) => ({
-      id: m.id,
-      content: m.content,
-      confidence: m.confidence,
-      category: m.category,
-      subject: m.subject_wa_id,
-    }));
-
-    const { answer, usage } = await provider.chat({ question, facts: factsForChat });
+    const composed = await composeMemoryBlock(db, provider, question);
+    const { answer, usage } = await provider.chat({
+      question,
+      memoryBlock: composed.block,
+    });
 
     res.json({
       answer,
-      citations: matches,
+      citations: composed.citations,
+      preferences: composed.preferences,
+      cluster_summaries: composed.cluster_summaries,
+      episodes: composed.episodes,
+      matched_subjects: composed.matched_subjects,
+      memory_block: composed.block,
+      budget: composed.budget,
       usage,
     });
   } catch (err) {
@@ -88,34 +93,68 @@ app.get('/api/whitelist', (_req: Request, res: Response) => {
 
 app.post('/api/import-chat', (req: Request, res: Response) => {
   try {
-    const { content, waId, me } = req.body as {
+    const { content, waId, phone, me, displayName } = req.body as {
       content?: unknown;
       waId?: unknown;
+      phone?: unknown;
       me?: unknown;
+      displayName?: unknown;
     };
     if (typeof content !== 'string' || !content.trim()) {
       return res.status(400).json({ error: 'content (the file text) is required' });
-    }
-    if (typeof waId !== 'string' || !waId.trim()) {
-      return res.status(400).json({ error: 'waId is required' });
     }
     if (typeof me !== 'string' || !me.trim()) {
       return res.status(400).json({ error: 'me (your display name in the export) is required' });
     }
 
+    let resolvedWaId: string;
+    if (typeof waId === 'string' && waId.trim()) {
+      resolvedWaId = waId.trim();
+    } else if (typeof phone === 'string' && phone.trim()) {
+      try {
+        resolvedWaId = phoneToWaId(phone);
+      } catch (err) {
+        return res
+          .status(400)
+          .json({ error: err instanceof Error ? err.message : String(err) });
+      }
+    } else {
+      return res
+        .status(400)
+        .json({ error: 'either phone or waId is required' });
+    }
+
+    const explicitDisplay =
+      typeof displayName === 'string' && displayName.trim() ? displayName.trim() : null;
+    const detectedDisplay = explicitDisplay ? null : detectOtherSender(content, me);
+    const finalDisplay = explicitDisplay ?? detectedDisplay;
+
     const wl = getWhitelist();
-    const wlEntry = wl.get(waId);
-    if (!wlEntry) {
-      return res.status(400).json({
-        error: `${waId} is not in the whitelist (${whitelistPath}). Add it first, then retry.`,
+    const existing = wl.get(resolvedWaId);
+    let whitelistResult: { added: boolean; updated: boolean } = {
+      added: false,
+      updated: false,
+    };
+    if (!existing) {
+      whitelistResult = addContactToWhitelistFile(whitelistPath, {
+        wa_id: resolvedWaId,
+        display_name: finalDisplay,
       });
+      // Reload so the in-process whitelist + DB sync reflect the new entry.
+      getWhitelist();
+    } else if (!existing.display_name && finalDisplay) {
+      whitelistResult = addContactToWhitelistFile(whitelistPath, {
+        wa_id: resolvedWaId,
+        display_name: finalDisplay,
+      });
+      getWhitelist();
     }
 
     const stats = importChat(db, {
       content,
-      waId,
+      waId: resolvedWaId,
       me,
-      displayName: wlEntry.display_name ?? null,
+      displayName: finalDisplay ?? existing?.display_name ?? null,
     });
 
     if (stats.emitted === 0) {
@@ -123,10 +162,18 @@ app.post('/api/import-chat', (req: Request, res: Response) => {
         error:
           "no messages emitted — check the 'me' display name matches the export's sender labels exactly, and the date format is DD/MM/YY",
         stats,
+        wa_id: resolvedWaId,
+        detected_display_name: detectedDisplay,
       });
     }
 
-    res.json({ stats });
+    res.json({
+      stats,
+      wa_id: resolvedWaId,
+      display_name: finalDisplay ?? existing?.display_name ?? null,
+      detected_display_name: detectedDisplay,
+      whitelist: whitelistResult,
+    });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }

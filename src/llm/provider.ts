@@ -35,13 +35,7 @@ export interface UsageMetadata {
 
 export interface ChatInput {
   question: string;
-  facts: Array<{
-    id: number;
-    content: string;
-    confidence: number;
-    category: string;
-    subject: string;
-  }>;
+  memoryBlock: string;
 }
 
 export type EmbedMode = 'document' | 'query';
@@ -60,6 +54,18 @@ export interface ConsolidateInput {
   candidates: ExtractedFact[];
 }
 
+export interface SummarizeClusterInput {
+  subject: string;
+  contactDisplayName?: string | null;
+  category: FactCategory;
+  facts: Array<{
+    id: number;
+    content: string;
+    confidence: number;
+    age_days: number;
+  }>;
+}
+
 export type ConsolidationOp =
   | { op: 'ADD'; candidate_index: number; content: string; category: FactCategory; confidence: number }
   | { op: 'UPDATE'; candidate_index: number; old_fact_id: number; content: string; category: FactCategory; confidence: number }
@@ -72,6 +78,9 @@ export interface LLMProvider {
   consolidate(
     input: ConsolidateInput
   ): Promise<{ ops: ConsolidationOp[]; usage: UsageMetadata }>;
+  summarizeCluster(
+    input: SummarizeClusterInput
+  ): Promise<{ summary: string; usage: UsageMetadata }>;
   embed(text: string, mode?: EmbedMode): Promise<{ vector: number[]; usage: UsageMetadata }>;
   chat(input: ChatInput): Promise<{ answer: string; usage: UsageMetadata }>;
 }

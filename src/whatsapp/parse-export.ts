@@ -93,6 +93,35 @@ export interface ParseStats {
   skipped_empty: number;
 }
 
+/**
+ * Scan the first ~200 header lines and return the most-frequent sender that
+ * isn't `meName`. Used by the import flow to auto-fill the contact's display
+ * name when the user only provides their own name. Returns null if no other
+ * sender appears (single-sided export, or wrong `meName`).
+ */
+export function detectOtherSender(text: string, meName: string): string | null {
+  const lines = text.split(/\r?\n/);
+  const counts = new Map<string, number>();
+  let scanned = 0;
+  for (const line of lines) {
+    const h = parseHeader(line);
+    if (!h) continue;
+    scanned++;
+    if (h.sender === meName) continue;
+    counts.set(h.sender, (counts.get(h.sender) ?? 0) + 1);
+    if (scanned > 200) break;
+  }
+  let best: string | null = null;
+  let bestCount = 0;
+  for (const [sender, n] of counts) {
+    if (n > bestCount) {
+      best = sender;
+      bestCount = n;
+    }
+  }
+  return best;
+}
+
 export function parseExport(
   text: string,
   meName: string

@@ -6,6 +6,11 @@ import {
   markFactSuperseded,
   markFactDeleted,
   existingFactsForSubject,
+  activeFactsForCluster,
+  countActiveFactsForSubject,
+  searchFactsForSubjectByVector,
+  upsertClusterSummary,
+  deleteClusterSummary,
   logProcessing,
   listUnprocessedBursts,
   getBurstMessages,
@@ -25,6 +30,8 @@ import { guardFacts } from './extract-guard';
 export interface ProcessOptions {
   batchSize?: number;
   log?: (line: string) => void;
+  /** For eval: ignore the BURST_GAP_SECONDS settling cutoff. */
+  includeUnsettledBursts?: boolean;
 }
 
 export interface ProcessStats {
@@ -36,8 +43,19 @@ export interface ProcessStats {
   facts_deleted: number;
   facts_dropped: number;
   facts_guarded: number;
+  clusters_refreshed: number;
+  clusters_deleted: number;
   errors: number;
 }
+
+const CLUSTER_SUMMARY_MIN_FACTS = 3;
+
+// Above this many active facts for a subject, the consolidator switches from
+// "send all existing facts to the LLM" to "embed each candidate first, then
+// pick top-N existing by vector similarity". Keeps consolidate prompts bounded
+// for power-chats with hundreds of facts about one person.
+const CONSOLIDATION_FULL_LIST_THRESHOLD = 30;
+const CONSOLIDATION_SIMILAR_PER_CANDIDATE = 12;
 
 function emptyStats(scanned = 0): ProcessStats {
   return {
@@ -49,6 +67,8 @@ function emptyStats(scanned = 0): ProcessStats {
     facts_deleted: 0,
     facts_dropped: 0,
     facts_guarded: 0,
+    clusters_refreshed: 0,
+    clusters_deleted: 0,
     errors: 0,
   };
 }
@@ -59,6 +79,8 @@ interface BurstResult {
   deleted: number;
   dropped: number;
   guarded: number;
+  clusters_refreshed: number;
+  clusters_deleted: number;
 }
 
 export async function processBatch(
@@ -68,7 +90,9 @@ export async function processBatch(
 ): Promise<ProcessStats> {
   const limit = opts.batchSize ?? 5;
   const log = opts.log ?? (() => {});
-  const bursts = listUnprocessedBursts(db, limit);
+  const bursts = listUnprocessedBursts(db, limit, {
+    includeUnsettled: opts.includeUnsettledBursts,
+  });
 
   const stats = emptyStats(bursts.length);
 
@@ -84,6 +108,8 @@ export async function processBatch(
         stats.facts_deleted += result.deleted;
         stats.facts_dropped += result.dropped;
         stats.facts_guarded += result.guarded;
+        stats.clusters_refreshed += result.clusters_refreshed;
+        stats.clusters_deleted += result.clusters_deleted;
       }
     } catch (err) {
       stats.errors++;
@@ -162,7 +188,15 @@ async function processOne(
     } else {
       log(`  burst ${burst.id} all ${extractResult.facts.length} fact(s) dropped by guard`);
     }
-    return { added: 0, updated: 0, deleted: 0, dropped: 0, guarded: guarded.length };
+    return {
+      added: 0,
+      updated: 0,
+      deleted: 0,
+      dropped: 0,
+      guarded: guarded.length,
+      clusters_refreshed: 0,
+      clusters_deleted: 0,
+    };
   }
 
   const groups = new Map<string, ExtractedFact[]>();
@@ -180,13 +214,48 @@ async function processOne(
 
   const ops: ResolvedOp[] = [];
 
+  // Track the (subject, category) of every existing fact we touch, so a refresh
+  // pass after the writeTx can rebuild affected cluster summaries — including
+  // when an UPDATE moves a fact between categories.
+  const oldFactCluster = new Map<number, { subject: string; category: string }>();
+
+  // Embeddings produced during consolidation (large-subject path). Reused in
+  // the writeTx for ADD/UPDATE so we don't pay to embed the same content twice.
+  const precomputedEmbeddings = new Map<
+    ExtractedFact,
+    { vector: number[]; usage: { model: string; tokens_in: number; tokens_out: number } }
+  >();
+
   for (const [subjectKey, candidates] of groups) {
-    const existing = existingFactsForSubject(db, subjectKey);
     const subjectStored = subjectKey;
 
-    if (existing.length === 0) {
+    const activeCount = countActiveFactsForSubject(db, subjectKey);
+    let existing: ActiveFactRow[];
+
+    if (activeCount === 0) {
       for (const c of candidates) ops.push({ kind: 'add', subject: subjectStored, fact: c });
       continue;
+    } else if (activeCount <= CONSOLIDATION_FULL_LIST_THRESHOLD) {
+      existing = existingFactsForSubject(db, subjectKey);
+    } else {
+      existing = await selectExistingByVectorSim(
+        db,
+        provider,
+        subjectKey,
+        candidates,
+        precomputedEmbeddings,
+        burst.id,
+        log
+      );
+      // Vector search may return zero rows for very off-topic candidates;
+      // fall back to recency so the LLM has *something* to compare against.
+      if (existing.length === 0) {
+        existing = existingFactsForSubject(db, subjectKey);
+      }
+    }
+
+    for (const e of existing) {
+      oldFactCluster.set(e.id, { subject: e.subject_wa_id, category: e.category });
     }
 
     const consolidateInput: ConsolidateInput = {
@@ -231,6 +300,11 @@ async function processOne(
   );
   const embedded = new Map<ResolvedOp, { vector: number[]; usage: { model: string; tokens_in: number; tokens_out: number } }>();
   for (const o of toEmbed) {
+    const reused = precomputedEmbeddings.get(o.fact);
+    if (reused) {
+      embedded.set(o, reused);
+      continue;
+    }
     const r = await provider.embed(o.fact.content);
     embedded.set(o, { vector: r.vector, usage: r.usage });
   }
@@ -241,6 +315,13 @@ async function processOne(
     deleted: 0,
     dropped: 0,
     guarded: guarded.length,
+    clusters_refreshed: 0,
+    clusters_deleted: 0,
+  };
+
+  const affectedClusters = new Set<string>();
+  const recordCluster = (subject: string, category: string) => {
+    affectedClusters.add(`${subject} ${category}`);
   };
 
   const writeTx = db.transaction(() => {
@@ -264,6 +345,7 @@ async function processOne(
           tokens_out: e.usage.tokens_out,
         });
         result.added++;
+        recordCluster(o.subject, o.fact.category);
         log(`  burst ${burst.id} ADD [${o.fact.category}] about ${o.subject}: ${o.fact.content}`);
       } else if (o.kind === 'update') {
         const e = embedded.get(o)!;
@@ -285,10 +367,15 @@ async function processOne(
           tokens_out: e.usage.tokens_out,
         });
         result.updated++;
+        recordCluster(o.subject, o.fact.category);
+        const old = oldFactCluster.get(o.oldId);
+        if (old && old.category !== o.fact.category) recordCluster(old.subject, old.category);
         log(`  burst ${burst.id} UPDATE fact ${o.oldId} → ${newId} about ${o.subject}: ${o.fact.content}`);
       } else if (o.kind === 'delete') {
         markFactDeleted(db, o.oldId);
         result.deleted++;
+        const old = oldFactCluster.get(o.oldId);
+        if (old) recordCluster(old.subject, old.category);
         log(`  burst ${burst.id} DELETE fact ${o.oldId} — ${o.reason}`);
       } else {
         result.dropped++;
@@ -300,7 +387,110 @@ async function processOne(
   });
   writeTx();
 
+  for (const key of affectedClusters) {
+    const sep = key.indexOf(' ');
+    const subject = key.slice(0, sep);
+    const category = key.slice(sep + 1);
+    try {
+      const refreshed = await refreshClusterSummary(db, provider, burst.id, subject, category, log);
+      if (refreshed === 'refreshed') result.clusters_refreshed++;
+      else if (refreshed === 'deleted') result.clusters_deleted++;
+    } catch (err) {
+      log(
+        `  burst ${burst.id} CLUSTER ${subject}/${category} refresh ERROR: ${
+          err instanceof Error ? err.message : err
+        }`
+      );
+    }
+  }
+
   return result;
+}
+
+/**
+ * Build the "existing facts" slate for the consolidator when a subject has
+ * too many active facts to send them all. Embeds each candidate, runs a
+ * subject-restricted vector search, unions the top-N per candidate, and
+ * caches the embeddings so the writeTx can reuse them for ADD/UPDATE rows.
+ */
+async function selectExistingByVectorSim(
+  db: DB,
+  provider: LLMProvider,
+  subject: string,
+  candidates: ExtractedFact[],
+  cache: Map<
+    ExtractedFact,
+    { vector: number[]; usage: { model: string; tokens_in: number; tokens_out: number } }
+  >,
+  burstId: number,
+  log: (line: string) => void
+): Promise<ActiveFactRow[]> {
+  const merged = new Map<number, ActiveFactRow>();
+  for (const c of candidates) {
+    const r = await provider.embed(c.content);
+    cache.set(c, { vector: r.vector, usage: r.usage });
+    logProcessing(db, {
+      burst_id: burstId,
+      stage: 'embed',
+      model: r.usage.model + ' [pre-consolidate]',
+      tokens_in: r.usage.tokens_in,
+      tokens_out: r.usage.tokens_out,
+    });
+    const hits = searchFactsForSubjectByVector(
+      db,
+      r.vector,
+      subject,
+      CONSOLIDATION_SIMILAR_PER_CANDIDATE
+    );
+    for (const h of hits) merged.set(h.id, h);
+  }
+  log(
+    `  burst ${burstId} CONSOLIDATE subject=${subject} vec-selected ${merged.size} existing for ${candidates.length} candidate(s)`
+  );
+  return [...merged.values()];
+}
+
+async function refreshClusterSummary(
+  db: DB,
+  provider: LLMProvider,
+  burstId: number,
+  subject: string,
+  category: string,
+  log: (line: string) => void
+): Promise<'refreshed' | 'deleted' | 'noop'> {
+  const facts = activeFactsForCluster(db, subject, category);
+  if (facts.length < CLUSTER_SUMMARY_MIN_FACTS) {
+    deleteClusterSummary(db, subject, category);
+    return 'deleted';
+  }
+
+  const r = await provider.summarizeCluster({
+    subject,
+    category: category as ExtractedFact['category'],
+    facts: facts.map((f) => ({
+      id: f.id,
+      content: f.content,
+      confidence: f.confidence,
+      age_days: ageDays(f),
+    })),
+  });
+  upsertClusterSummary(db, {
+    subject_wa_id: subject,
+    category,
+    summary: r.summary,
+    fact_ids: facts.map((f) => f.id),
+  });
+  logProcessing(db, {
+    burst_id: burstId,
+    stage: 'extract',
+    model: r.usage.model + ' [summarize]',
+    tokens_in: r.usage.tokens_in,
+    tokens_out: r.usage.tokens_out,
+  });
+  log(
+    `  burst ${burstId} CLUSTER ${subject}/${category} (${facts.length} facts) → ${r.summary.length}c`
+  );
+  return 'refreshed';
 }
 
 function ageDays(fact: ActiveFactRow): number {
