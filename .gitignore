@@ -8,3 +8,5 @@ config/whitelist.json
 *.log
 .DS_Store
 .context/
+/eval/
+eval-report*.md

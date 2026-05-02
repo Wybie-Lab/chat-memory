@@ -76,3 +76,33 @@ CREATE TABLE IF NOT EXISTS processing_log (
   cost_usd     REAL,
   ts           INTEGER NOT NULL
 );
+
+-- Many supporting turns / bursts per fact. The legacy facts.source_burst_id
+-- and facts.source_msg_id are still populated for backward-compat reads, but
+-- this table is the source of truth for "what evidence backs this fact".
+CREATE TABLE IF NOT EXISTS fact_sources (
+  fact_id          INTEGER NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+  source_burst_id  INTEGER REFERENCES conversation_bursts(id),
+  source_msg_id    INTEGER REFERENCES raw_messages(id),
+  attached_at      INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_fact_sources_fact ON fact_sources(fact_id);
+CREATE INDEX IF NOT EXISTS idx_fact_sources_burst ON fact_sources(source_burst_id);
+CREATE INDEX IF NOT EXISTS idx_fact_sources_msg ON fact_sources(source_msg_id);
+
+-- Rolled-up prose summaries per (subject, category). Refreshed by the
+-- pipeline whenever facts change for that group. Read at chat time via
+-- composeMemoryBlock — agents read prose better than triples.
+CREATE TABLE IF NOT EXISTS cluster_summaries (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  subject_wa_id     TEXT NOT NULL,
+  category          TEXT NOT NULL,
+  summary           TEXT NOT NULL,
+  fact_count        INTEGER NOT NULL,
+  fact_ids_json     TEXT NOT NULL,
+  last_refreshed_at INTEGER NOT NULL,
+  UNIQUE(subject_wa_id, category)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cluster_subject ON cluster_summaries(subject_wa_id);

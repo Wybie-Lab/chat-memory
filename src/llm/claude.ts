@@ -7,21 +7,29 @@ import type {
   ConsolidateInput,
   ConsolidationOp,
   EmbedMode,
+  SummarizeClusterInput,
   UsageMetadata,
 } from './provider';
 
 const FILTER_MODEL = 'claude-haiku-4-5';
 const EXTRACT_MODEL = 'claude-sonnet-4-6';
 const CONSOLIDATE_MODEL = 'claude-sonnet-4-6';
+const SUMMARIZE_MODEL = 'claude-sonnet-4-6';
 const CHAT_MODEL = 'claude-sonnet-4-6';
 const EMBED_MODEL = 'embed-multilingual-v3.0';
 
-const CHAT_SYSTEM_PROMPT = `You answer questions about the user's WhatsApp contacts using only the provided facts. Each fact has a confidence score (0-1) and an ID.
+const CHAT_SYSTEM_PROMPT = `You answer questions about the user's WhatsApp contacts using only the structured <memory> block provided.
+
+The <memory> block has up to four sections:
+- <preferences> — durable preferences about the user, always relevant.
+- <known_facts> — atomic facts ranked by relevance to the question. Each line ends with [fact:ID].
+- <subject_summaries> — rolled-up prose summaries per (subject, category). Use these for context; cite the underlying facts via [fact:ID] from <known_facts> when applicable.
+- <recent_episodes> — recent events and commitments, time-anchored.
 
 Rules:
-- If the facts don't contain enough info to answer, say so honestly. Don't invent details.
-- Cite specific facts inline using the format [fact:ID]. Use multiple citations when supporting a claim.
-- Lower-confidence facts (<0.7) should be hedged ("she may have mentioned..." rather than "she said...").
+- If <memory> doesn't contain enough info to answer, say so honestly. Don't invent details, names, or dates.
+- Cite supporting facts inline using [fact:ID]. Cite at least one fact per non-trivial claim. Multiple citations are fine.
+- A fact's confidence is implied by how it's phrased in <memory>. If wording is hedged ("may have", "reportedly"), echo that hedging in your answer.
 - Keep answers concise — one paragraph unless the user asks for detail.
 - Match the user's language (English/Italian/etc.).
 
@@ -221,6 +229,30 @@ const ConsolidateZod = z.object({
   ),
 });
 
+const SUMMARIZE_SYSTEM_PROMPT = `You are writing a one-paragraph rolled-up summary of what we know about ONE person within ONE category, drawn from a list of atomic facts. The summary will be injected into a memory block that an AI assistant reads at chat time, instead of the raw facts. The AI reads prose better than triples — your job is to make these facts readable as one coherent picture.
+
+Rules:
+- Output a single short paragraph: 1–4 sentences, ≤ 350 characters total.
+- Synthesize: integrate overlapping facts. Don't list each one separately.
+- Stay grounded: every claim must be supported by the input facts. Do NOT invent details, dates, or relationships.
+- Hedge low-confidence content. If a fact has confidence < 0.6, qualify it ("may have", "reportedly") or omit it.
+- Use the subject's name as given. If contactDisplayName is provided, prefer it; otherwise use the subject id verbatim.
+- Match the dominant language of the source facts (Italian/English/etc.). If mixed, pick whichever is the majority.
+- Plain prose only. No bullet points, no headings, no fact IDs, no preamble like "Here is a summary:".`;
+
+const SUMMARIZE_SCHEMA_JSON = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+  },
+  required: ['summary'],
+  additionalProperties: false,
+} as const;
+
+const SummarizeZod = z.object({
+  summary: z.string(),
+});
+
 interface AgentCallResult {
   structured: unknown;
   tokens_in: number;
@@ -330,6 +362,20 @@ export class ClaudeProvider implements LLMProvider {
     return {
       ops,
       usage: usageOf(CONSOLIDATE_MODEL, result),
+    };
+  }
+
+  async summarizeCluster(input: SummarizeClusterInput) {
+    const result = await callAgent({
+      systemPrompt: SUMMARIZE_SYSTEM_PROMPT,
+      userPrompt: formatSummarizeMessage(input),
+      model: SUMMARIZE_MODEL,
+      outputSchema: SUMMARIZE_SCHEMA_JSON as unknown as Record<string, unknown>,
+    });
+    const parsed = SummarizeZod.parse(result.structured);
+    return {
+      summary: parsed.summary.trim(),
+      usage: usageOf(SUMMARIZE_MODEL, result),
     };
   }
 
@@ -538,16 +584,25 @@ function validateOp(
   }
 }
 
-function formatChatMessage(input: ChatInput): string {
-  const lines = [`Question: ${input.question}`, '', 'Facts (sorted by relevance):'];
-  if (input.facts.length === 0) {
-    lines.push('  (none)');
-  } else {
-    for (const f of input.facts) {
-      lines.push(
-        `  [fact:${f.id}] (${f.category}, confidence=${f.confidence.toFixed(2)}, about=${f.subject}) ${f.content}`
-      );
-    }
+function formatSummarizeMessage(input: SummarizeClusterInput): string {
+  const subjectLabel = input.contactDisplayName
+    ? `${input.contactDisplayName} (id: ${input.subject})`
+    : input.subject;
+  const lines = [
+    `Subject: ${subjectLabel}`,
+    `Category: ${input.category}`,
+    '',
+    'Active facts:',
+  ];
+  for (const f of input.facts) {
+    lines.push(
+      `  [${f.id}] (conf=${f.confidence.toFixed(2)}, ${Math.round(f.age_days)}d old) ${f.content}`
+    );
   }
+  lines.push('', `Write the rolled-up summary for "${subjectLabel}" (${input.category}).`);
   return lines.join('\n');
+}
+
+function formatChatMessage(input: ChatInput): string {
+  return [input.memoryBlock, '', `Question: ${input.question}`].join('\n');
 }

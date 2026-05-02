@@ -51,6 +51,46 @@ export function loadWhitelist(configPath: string): Whitelist {
   return new Whitelist(parsed);
 }
 
+/**
+ * Append (or update) a single entry in the whitelist file. Idempotent: if
+ * `wa_id` already exists, only `display_name` and `notes` are merged (existing
+ * non-null values win to avoid clobbering hand edits). Creates the file with
+ * the standard shape if it doesn't exist yet.
+ */
+export function addContactToWhitelistFile(
+  configPath: string,
+  entry: WhitelistEntry
+): { added: boolean; updated: boolean } {
+  const abs = path.resolve(configPath);
+  let file: WhitelistFile;
+  if (fs.existsSync(abs)) {
+    file = JSON.parse(fs.readFileSync(abs, 'utf-8')) as WhitelistFile;
+    if (!Array.isArray(file.contacts)) file.contacts = [];
+    if (!Array.isArray(file.groups)) file.groups = [];
+  } else {
+    file = { contacts: [], groups: [] };
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+  }
+
+  const isGroup = entry.wa_id.endsWith('@g.us');
+  const bucket = isGroup ? file.groups : file.contacts;
+  const existing = bucket.find((e) => e.wa_id === entry.wa_id);
+  if (existing) {
+    existing.display_name = existing.display_name ?? entry.display_name ?? null;
+    existing.notes = existing.notes ?? entry.notes ?? null;
+    fs.writeFileSync(abs, JSON.stringify(file, null, 2) + '\n');
+    return { added: false, updated: true };
+  }
+
+  bucket.push({
+    wa_id: entry.wa_id,
+    display_name: entry.display_name ?? null,
+    notes: entry.notes ?? null,
+  });
+  fs.writeFileSync(abs, JSON.stringify(file, null, 2) + '\n');
+  return { added: true, updated: false };
+}
+
 export function syncWhitelistToDb(db: DB, wl: Whitelist): void {
   const now = Math.floor(Date.now() / 1000);
   const upsert = db.prepare(
