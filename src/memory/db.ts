@@ -219,6 +219,101 @@ export function insertEmbedding(db: DB, factId: number, vector: number[]): void 
   );
 }
 
+export interface FactRow {
+  id: number;
+  subject_wa_id: string;
+  category: string;
+  content: string;
+  confidence: number;
+  extracted_at: number;
+  source_msg_id: number;
+  source_body: string;
+  source_ts: number;
+  source_direction: 'in' | 'out';
+}
+
+export interface FactSearchResult extends FactRow {
+  distance: number;
+}
+
+export interface FactListFilters {
+  subject?: string;
+  category?: string;
+  contains?: string;
+}
+
+export function listFacts(
+  db: DB,
+  filters: FactListFilters = {},
+  limit = 200
+): FactRow[] {
+  const where: string[] = [];
+  const params: unknown[] = [];
+
+  if (filters.subject) {
+    where.push('f.subject_wa_id LIKE ?');
+    params.push(`%${filters.subject}%`);
+  }
+  if (filters.category) {
+    where.push('f.category = ?');
+    params.push(filters.category);
+  }
+  if (filters.contains) {
+    where.push('f.content LIKE ?');
+    params.push(`%${filters.contains}%`);
+  }
+
+  const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const sql = `
+    SELECT
+      f.id, f.subject_wa_id, f.category, f.content, f.confidence, f.extracted_at,
+      f.source_msg_id,
+      rm.body AS source_body,
+      rm.ts AS source_ts,
+      rm.direction AS source_direction
+    FROM facts f
+    JOIN raw_messages rm ON rm.id = f.source_msg_id
+    ${whereClause}
+    ORDER BY f.id DESC
+    LIMIT ?
+  `;
+  params.push(limit);
+  return db.prepare(sql).all(...params) as FactRow[];
+}
+
+export function searchFactsByVector(
+  db: DB,
+  vector: number[],
+  k: number
+): FactSearchResult[] {
+  const buf = Buffer.from(new Float32Array(vector).buffer);
+  return db
+    .prepare(
+      `SELECT
+         fe.fact_id AS id,
+         fe.distance AS distance,
+         f.subject_wa_id, f.category, f.content, f.confidence, f.extracted_at,
+         f.source_msg_id,
+         rm.body AS source_body,
+         rm.ts AS source_ts,
+         rm.direction AS source_direction
+       FROM fact_embeddings fe
+       JOIN facts f ON f.id = fe.fact_id
+       JOIN raw_messages rm ON rm.id = f.source_msg_id
+       WHERE fe.embedding MATCH ?
+         AND k = ?
+       ORDER BY fe.distance`
+    )
+    .all(buf, k) as FactSearchResult[];
+}
+
+export function listCategories(db: DB): string[] {
+  const rows = db
+    .prepare('SELECT DISTINCT category FROM facts ORDER BY category')
+    .all() as Array<{ category: string }>;
+  return rows.map((r) => r.category);
+}
+
 export function logProcessing(db: DB, args: ProcessingLogInput): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(

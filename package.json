@@ -9,10 +9,12 @@
     "backfill": "tsx scripts/backfill.ts",
     "process": "tsx scripts/process.ts",
     "reset-pipeline": "tsx scripts/reset-pipeline.ts",
+    "web": "tsx src/web/server.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.1.5",
+    "express": "^4.21.0",
     "zod": "^3.23.8",
     "better-sqlite3": "^11.5.0",
     "dotenv": "^16.4.5",
@@ -22,6 +24,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
+    "@types/express": "^5.0.0",
     "@types/node": "^22.9.0",
     "@types/qrcode-terminal": "^0.12.2",
     "tsx": "^4.19.2",

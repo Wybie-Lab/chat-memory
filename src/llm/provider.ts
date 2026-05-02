@@ -37,8 +37,22 @@ export interface UsageMetadata {
   tokens_out: number;
 }
 
+export interface ChatInput {
+  question: string;
+  facts: Array<{
+    id: number;
+    content: string;
+    confidence: number;
+    category: string;
+    subject: string;
+  }>;
+}
+
+export type EmbedMode = 'document' | 'query';
+
 export interface LLMProvider {
   filter(input: FilterInput): Promise<FilterResult & { usage: UsageMetadata }>;
   extract(input: ExtractInput): Promise<{ facts: ExtractedFact[]; usage: UsageMetadata }>;
-  embed(text: string): Promise<{ vector: number[]; usage: UsageMetadata }>;
+  embed(text: string, mode?: EmbedMode): Promise<{ vector: number[]; usage: UsageMetadata }>;
+  chat(input: ChatInput): Promise<{ answer: string; usage: UsageMetadata }>;
 }

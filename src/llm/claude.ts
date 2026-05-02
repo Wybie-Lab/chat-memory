@@ -4,12 +4,26 @@ import type {
   LLMProvider,
   FilterInput,
   ExtractInput,
+  ChatInput,
+  EmbedMode,
   UsageMetadata,
 } from './provider';
 
 const FILTER_MODEL = 'claude-haiku-4-5';
 const EXTRACT_MODEL = 'claude-sonnet-4-6';
+const CHAT_MODEL = 'claude-sonnet-4-6';
 const EMBED_MODEL = 'embed-multilingual-v3.0';
+
+const CHAT_SYSTEM_PROMPT = `You answer questions about the user's WhatsApp contacts using only the provided facts. Each fact has a confidence score (0-1) and an ID.
+
+Rules:
+- If the facts don't contain enough info to answer, say so honestly. Don't invent details.
+- Cite specific facts inline using the format [fact:ID]. Use multiple citations when supporting a claim.
+- Lower-confidence facts (<0.7) should be hedged ("she may have mentioned..." rather than "she said...").
+- Keep answers concise — one paragraph unless the user asks for detail.
+- Match the user's language (English/Italian/etc.).
+
+Return only the answer text — no preamble like "Based on the facts:".`;
 
 const FILTER_SYSTEM_PROMPT = `You are a memory curator. Your job is to decide whether a single WhatsApp message is worth remembering long-term, as part of building a personal memory layer about the people in someone's life.
 
@@ -50,7 +64,13 @@ Rules:
 - Ground every fact in the literal text of the current message. If you can't quote the supporting words, don't extract the fact.
 - Resolve relative dates ("tomorrow", "next week") using the message date. If the message just says "tomorrow" without indicating what's happening, do NOT extract a fact — the date alone is not the fact.
 - Treat colloquialisms, idioms, sarcasm, and dialect phrases as expressive language, not literal facts. Use context to recognize them.
-- Subject = name of the person the fact is about. Default to the contact name unless the message clearly refers to someone else.
+- SUBJECT ATTRIBUTION (critical): the message is labelled with its SENDER. Use the sender to resolve first-person and possessives:
+  • First-person ("io", "I", "sono", "I'm", "ho", "I have") → subject is the SENDER. So "io sono stanco" sent by me → subject is "me"; sent by the contact → subject is the contact.
+  • First-person possessives ("my mom", "i miei", "mio padre", "mia sorella", "my X") refer to the SENDER's relations. "i miei" sent by me means MY parents; "i miei" sent by the contact means the CONTACT's parents.
+  • Second-person ("tu", "you", "sei") → subject is the addressee (the contact in a DM if I'm sending; me if the contact is sending).
+  • Explicitly named subject in the current message → use that name.
+  • Recent context unambiguously establishes the third-person subject → use that.
+  Italian, Spanish, and many other languages drop subjects ("deve partire", "se va"). A third-person verb with NO named subject and NO clear contextual antecedent is ambiguous — DO NOT extract the fact. Skip it. Never default to the contact.
 - Confidence: 0.0–1.0. Use values below 0.7 when the fact requires inference. Skip facts you'd rate below 0.4.
 - Each fact should be self-contained (readable without the original message).
 - Return an empty list if the message contains no durable, grounded facts.
@@ -199,7 +219,7 @@ export class ClaudeProvider implements LLMProvider {
     };
   }
 
-  async embed(text: string) {
+  async embed(text: string, mode: EmbedMode = 'document') {
     const apiKey = process.env.COHERE_API_KEY;
     if (!apiKey) {
       throw new Error('COHERE_API_KEY not set');
@@ -214,7 +234,7 @@ export class ClaudeProvider implements LLMProvider {
       body: JSON.stringify({
         texts: [text],
         model: EMBED_MODEL,
-        input_type: 'search_document',
+        input_type: mode === 'query' ? 'search_query' : 'search_document',
         embedding_types: ['float'],
       }),
     });
@@ -237,6 +257,49 @@ export class ClaudeProvider implements LLMProvider {
       },
     };
   }
+
+  async chat(input: ChatInput) {
+    const userPrompt = formatChatMessage(input);
+    const stream = query({
+      prompt: userPrompt,
+      options: {
+        systemPrompt: CHAT_SYSTEM_PROMPT,
+        model: CHAT_MODEL,
+        allowedTools: [],
+        maxTurns: 5,
+        settingSources: [],
+      },
+    });
+
+    let answer = '';
+    let tokens_in = 0;
+    let tokens_out = 0;
+
+    for await (const message of stream) {
+      if (message.type === 'assistant') {
+        for (const block of message.message.content) {
+          const b = block as { type: string; text?: string };
+          if (b.type === 'text' && typeof b.text === 'string') {
+            answer += b.text;
+          }
+        }
+      } else if (message.type === 'result') {
+        if (message.subtype !== 'success') {
+          const errs = message.errors.length ? message.errors.join('; ') : '(no error message)';
+          throw new Error(`claude-agent-sdk chat ${message.subtype}: ${errs}`);
+        }
+        for (const u of Object.values(message.modelUsage)) {
+          tokens_in += u.inputTokens;
+          tokens_out += u.outputTokens;
+        }
+      }
+    }
+
+    return {
+      answer: answer.trim(),
+      usage: { model: CHAT_MODEL, tokens_in, tokens_out },
+    };
+  }
 }
 
 export function createLLMProvider(): LLMProvider {
@@ -250,35 +313,33 @@ export function createLLMProvider(): LLMProvider {
 }
 
 function formatFilterMessage(input: FilterInput): string {
+  const sender = input.senderName ?? input.contactName ?? 'unknown';
   const lines = [
     `Contact: ${input.contactName ?? 'unknown'}${input.contactNotes ? ` — ${input.contactNotes}` : ''}`,
   ];
-  if (input.isGroup) {
-    lines.push(`Group chat — sender: ${input.senderName ?? 'unknown'}`);
-  }
+  if (input.isGroup) lines.push('Group chat');
   if (input.recentContext && input.recentContext.length > 0) {
     lines.push('', 'Recent conversation:');
     for (const line of input.recentContext) lines.push(`  ${line}`);
   }
-  lines.push('', `Current message: "${input.body}"`);
+  lines.push('', `Current message (sent by ${sender}): "${input.body}"`);
   lines.push('', 'Should this be remembered?');
   return lines.join('\n');
 }
 
 function formatExtractMessage(input: ExtractInput): string {
   const dateISO = new Date(input.ts * 1000).toISOString().slice(0, 10);
+  const sender = input.senderName ?? input.contactName ?? 'unknown';
   const lines = [
     `Date: ${dateISO}`,
     `Contact: ${input.contactName ?? 'unknown'}${input.contactNotes ? ` — ${input.contactNotes}` : ''}`,
   ];
-  if (input.isGroup) {
-    lines.push(`Group chat — sender: ${input.senderName ?? 'unknown'}`);
-  }
+  if (input.isGroup) lines.push('Group chat');
   if (input.recentContext && input.recentContext.length > 0) {
     lines.push('', 'Recent conversation:');
     for (const line of input.recentContext) lines.push(`  ${line}`);
   }
-  lines.push('', `Current message: "${input.body}"`);
+  lines.push('', `Current message (sent by ${sender}): "${input.body}"`);
   lines.push('', 'Extract facts from the current message.');
   return lines.join('\n');
 }
@@ -289,4 +350,18 @@ function usageOf(model: string, result: AgentCallResult): UsageMetadata {
     tokens_in: result.tokens_in,
     tokens_out: result.tokens_out,
   };
+}
+
+function formatChatMessage(input: ChatInput): string {
+  const lines = [`Question: ${input.question}`, '', 'Facts (sorted by relevance):'];
+  if (input.facts.length === 0) {
+    lines.push('  (none)');
+  } else {
+    for (const f of input.facts) {
+      lines.push(
+        `  [fact:${f.id}] (${f.category}, confidence=${f.confidence.toFixed(2)}, about=${f.subject}) ${f.content}`
+      );
+    }
+  }
+  return lines.join('\n');
 }
