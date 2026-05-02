@@ -1,6 +1,12 @@
 import 'dotenv/config';
 import { createWAClient } from './whatsapp/client';
-import { openDb, upsertContact, insertRawMessage } from './memory/db';
+import {
+  openDb,
+  upsertContact,
+  insertRawMessage,
+  assignMessageToBurst,
+  getLiveCutoff,
+} from './memory/db';
 import { loadWhitelist, syncWhitelistToDb } from './config/whitelist';
 import { createLLMProvider } from './llm/claude';
 import { processBatch } from './pipeline/process';
@@ -49,6 +55,12 @@ async function main() {
         ts,
       });
 
+      const cutoff = getLiveCutoff(db, contactId);
+      if (cutoff !== null && ts <= cutoff) {
+        console.log(`[skip] ${chatWaId} msg @ ${ts} <= live_cutoff ${cutoff} (covered by import)`);
+        return;
+      }
+
       const inserted = insertRawMessage(db, {
         wa_msg_id: msg.id._serialized,
         contact_id: contactId,
@@ -60,6 +72,10 @@ async function main() {
         media_pointer: null,
       });
 
+      if (inserted !== null && (msg.body ?? '').length > 0 && !msg.hasMedia) {
+        assignMessageToBurst(db, inserted);
+      }
+
       const tag = inserted === null ? 'DUP' : direction.toUpperCase();
       const senderLabel =
         senderContact.pushname ?? senderContact.name ?? senderContact.number ?? senderWaId;
@@ -70,10 +86,21 @@ async function main() {
   });
 
   let running = true;
-  process.on('SIGINT', () => {
-    console.log('\nshutting down...');
+  let shuttingDown = false;
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n${signal} received — shutting down cleanly...`);
     running = false;
-  });
+    try {
+      await client.destroy();
+    } catch (err) {
+      console.error('destroy error:', err instanceof Error ? err.message : err);
+    }
+    process.exit(0);
+  };
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
   const workerLoop = async () => {
     while (running) {
@@ -82,12 +109,12 @@ async function main() {
           batchSize: 5,
           log: (line) => console.log(`[pipeline] ${line}`),
         });
-        if (stats.scanned > 0) {
+        if (stats.bursts_scanned > 0) {
           console.log(
-            `[pipeline] scanned=${stats.scanned} kept=${stats.kept} dropped=${stats.dropped} facts=${stats.facts} errors=${stats.errors}`
+            `[pipeline] bursts=${stats.bursts_scanned} kept=${stats.bursts_kept}/dropped=${stats.bursts_dropped} | facts: +${stats.facts_added} updated=${stats.facts_updated} deleted=${stats.facts_deleted} dup=${stats.facts_dropped} guarded=${stats.facts_guarded} | errors=${stats.errors}`
           );
         }
-        await sleep(stats.scanned > 0 ? 500 : 5000);
+        await sleep(stats.bursts_scanned > 0 ? 500 : 5000);
       } catch (err) {
         console.error('[pipeline] loop error:', err);
         await sleep(10000);

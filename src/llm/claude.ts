@@ -2,15 +2,17 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type {
   LLMProvider,
-  FilterInput,
-  ExtractInput,
+  BurstInput,
   ChatInput,
+  ConsolidateInput,
+  ConsolidationOp,
   EmbedMode,
   UsageMetadata,
 } from './provider';
 
 const FILTER_MODEL = 'claude-haiku-4-5';
 const EXTRACT_MODEL = 'claude-sonnet-4-6';
+const CONSOLIDATE_MODEL = 'claude-sonnet-4-6';
 const CHAT_MODEL = 'claude-sonnet-4-6';
 const EMBED_MODEL = 'embed-multilingual-v3.0';
 
@@ -25,33 +27,31 @@ Rules:
 
 Return only the answer text — no preamble like "Based on the facts:".`;
 
-const FILTER_SYSTEM_PROMPT = `You are a memory curator. Your job is to decide whether a single WhatsApp message is worth remembering long-term, as part of building a personal memory layer about the people in someone's life.
+const FILTER_SYSTEM_PROMPT = `You are a memory curator. Your job is to decide whether a WhatsApp conversation burst — a contiguous run of messages between two people — contains anything worth remembering long-term, as part of building a personal memory layer about the people in someone's life.
 
-You may be given recent messages from the same chat as conversational context. Use that context to understand what the current message means (resolving idioms, references, ongoing topics). The decision applies ONLY to the current message — not to the context.
+A burst is the WHOLE unit of decision: if even ONE message in the burst contains something durable, KEEP the whole burst.
 
-KEEP messages that contain:
+KEEP if the burst contains:
 - Personal facts about a person (job, family, location, health, preferences, opinions)
-- ANY mention of family members, friends, partners, or recurring people in the contact's life — even passing references like "say hi to your mom" or "I'm with my grandma" count as relationship facts worth knowing
-- Personality traits or self-descriptions, even if said casually or jokingly ("I'm always late", "I complain a lot", "I'm bad at remembering names")
+- ANY mention of family members, friends, partners, or recurring people in the contact's life — even passing references like "say hi to your mom" or "I'm with my grandma" count
+- Personality traits or self-descriptions, even if said casually or jokingly ("I'm always late", "I complain a lot")
 - Scheduled events with dates or times (appointments, trips, birthdays, plans)
 - Commitments (a promise — to act, to deliver, to meet)
 - Significant emotional state changes (good news, bad news, milestones)
 - Specific concrete information that could be referenced later (names, places, organizations, preferences)
 
-DROP messages that are:
-- Pure greetings without context ("hi", "hey", "ciao", "good morning")
-- Pure acknowledgments ("ok", "thanks", "got it")
-- Pure reactions ("lol", "haha", "nice", emoji-only, single-word excitement)
-- Ephemeral logistics ("on my way", "5 min late", "where are you", "one sec")
-- Generic small talk, idioms, or jokes with no informational content (use the context to recognize idioms — e.g., a Venetian dialect phrase used colloquially is NOT a personal fact)
+DROP only if the ENTIRE burst is:
+- Pure greetings, acknowledgments, reactions ("hi", "hey", "ok", "thanks", "lol", emoji-only)
+- Pure ephemeral logistics ("on my way", "5 min late", "where are you", "one sec")
+- Generic small talk, idioms, or jokes with no informational content
 
-Lean toward KEEP. False positives are easier to clean later than false negatives are to recover. Drop only when the message clearly contains nothing durable — when in doubt, keep.
+Lean toward KEEP. False positives are easier to clean later than false negatives are to recover. Drop only when the burst clearly contains nothing durable across all of its lines.
 
 Return your decision strictly as JSON matching the provided schema. The reason field must be one short sentence under 15 words.`;
 
-const EXTRACT_SYSTEM_PROMPT = `You are extracting durable, structured facts about people from WhatsApp messages, to build a long-term memory.
+const EXTRACT_SYSTEM_PROMPT = `You are extracting durable, structured facts about people from a WhatsApp conversation burst — a contiguous run of messages between two people — to build a long-term memory.
 
-You may be given recent messages from the same chat as conversational context. Use the context to disambiguate references, idioms, and ongoing topics in the current message. CRITICAL: Only extract facts FROM the current message — never extract facts that appear only in the context. The context is read-only background.
+You are given the FULL burst, with each line labeled by sender ("me:" or the contact's name). Earlier lines in the burst provide context for later ones (idioms, references, ongoing topics). Extract facts from anywhere in the burst.
 
 For each fact you extract, classify it:
 - preference: things they like/dislike, opinions, tastes
@@ -61,19 +61,37 @@ For each fact you extract, classify it:
 - relationship: who-knows-who connections
 
 Rules:
-- Ground every fact in the literal text of the current message. If you can't quote the supporting words, don't extract the fact.
-- Resolve relative dates ("tomorrow", "next week") using the message date. If the message just says "tomorrow" without indicating what's happening, do NOT extract a fact — the date alone is not the fact.
-- Treat colloquialisms, idioms, sarcasm, and dialect phrases as expressive language, not literal facts. Use context to recognize them.
-- SUBJECT ATTRIBUTION (critical): the message is labelled with its SENDER. Use the sender to resolve first-person and possessives:
-  • First-person ("io", "I", "sono", "I'm", "ho", "I have") → subject is the SENDER. So "io sono stanco" sent by me → subject is "me"; sent by the contact → subject is the contact.
-  • First-person possessives ("my mom", "i miei", "mio padre", "mia sorella", "my X") refer to the SENDER's relations. "i miei" sent by me means MY parents; "i miei" sent by the contact means the CONTACT's parents.
-  • Second-person ("tu", "you", "sei") → subject is the addressee (the contact in a DM if I'm sending; me if the contact is sending).
-  • Explicitly named subject in the current message → use that name.
-  • Recent context unambiguously establishes the third-person subject → use that.
-  Italian, Spanish, and many other languages drop subjects ("deve partire", "se va"). A third-person verb with NO named subject and NO clear contextual antecedent is ambiguous — DO NOT extract the fact. Skip it. Never default to the contact.
+- Ground every fact in the literal text of the burst. If you can't quote the supporting words, don't extract the fact.
+- Resolve relative dates ("tomorrow", "next week") using the burst date provided. If a message says "tomorrow" without indicating what's happening, do NOT extract a fact — the date alone is not the fact.
+- Treat colloquialisms, idioms, sarcasm, and dialect phrases as expressive language, not literal facts.
+- SUBJECT ATTRIBUTION (critical): each line is labeled with its SENDER. Use the per-line sender to resolve first-person and possessives:
+  • First-person ("io", "I", "sono", "I'm", "ho", "I have") → subject is the SENDER OF THAT LINE. So "io sono stanco" sent by me → subject is "me"; sent by the contact → subject is the contact.
+  • First-person possessives ("my mom", "i miei", "mio padre", "mia sorella", "my X") refer to that line's SENDER's relations.
+  • Second-person ("tu", "you", "sei") → subject is the OTHER party in the burst.
+  • Explicitly named subject in the line → use that name.
+  • Earlier lines in the burst unambiguously establish the third-person subject by name → use that name.
+
+- UNNAMED THIRD-PERSON RULE (strict, no exceptions): a line that uses a third-person pronoun ("lei", "lui", "loro", "she", "he", "they") OR a dropped third-person subject (Italian/Spanish/Portuguese "deve partire", "se va", "vanno via", "está cansado") with NO named antecedent earlier in this burst is AMBIGUOUS.
+
+  When you cannot name the subject from this burst alone:
+  → DROP the fact entirely. Do not extract anything from those lines.
+  → DO NOT use the chat label / contact name as a fallback subject.
+  → DO NOT rewrite as "<contact> mentioned/discovered/told me that someone is doing X" — that fabricates a meta-fact the contact never asserted, and floods memory with junk.
+
+  The chat label is NOT a default subject. The subject of a fact must be a real, identifiable person. If you can't name them from this burst, skip.
+
+  WORKED EXAMPLE — burst with unresolved third-person "her":
+    Friend: did you hear about her promotion
+    Friend: she's flying to Tokyo next week
+    Friend: lucky her
+
+    WRONG: extract "Friend mentioned someone is flying to Tokyo" (subject=Friend). Friend is the speaker, not the subject; the actual subject ("her" / "she") has no antecedent in this burst.
+    WRONG: extract "the contact's colleague is flying to Tokyo" (subject=<chat label>). Adding qualifiers doesn't make the subject identifiable.
+    RIGHT: extract nothing from these lines. Return facts: [] (or only facts from OTHER lines in the burst that do have resolvable subjects).
 - Confidence: 0.0–1.0. Use values below 0.7 when the fact requires inference. Skip facts you'd rate below 0.4.
-- Each fact should be self-contained (readable without the original message).
-- Return an empty list if the message contains no durable, grounded facts.
+- DEDUPE within the burst: if the same fact is restated, extract it once.
+- Each fact should be self-contained (readable without the original burst).
+- Return an empty list if the burst contains no durable, grounded facts.
 
 Return your output strictly as JSON matching the provided schema.`;
 
@@ -123,6 +141,82 @@ const ExtractZod = z.object({
       category: z.enum(FACT_CATEGORIES),
       content: z.string(),
       confidence: z.number().min(0).max(1),
+    })
+  ),
+});
+
+const CONSOLIDATE_SYSTEM_PROMPT = `You are merging new candidate facts into an existing memory about ONE subject. For each candidate, decide one of:
+
+- ADD: candidate is genuinely new info not covered by any existing fact. Insert as a new fact.
+- UPDATE: candidate refines, replaces, or contradicts ONE specific existing fact (named by old_fact_id). The existing fact will be marked superseded; the candidate becomes the new active fact.
+- DELETE: an existing fact is now known to be wrong or obsolete, and the candidate provides no replacement worth keeping. Remove the existing fact; do not add the candidate.
+- DROP: the candidate is fully redundant with an existing fact (same info, no new detail). Ignore the candidate; keep memory unchanged.
+
+Rules:
+- Each candidate must appear in exactly one op (ADD, UPDATE, or DROP). DELETE ops do not consume a candidate.
+- An existing fact may appear in at most one op (UPDATE or DELETE) — never both.
+- Existing facts not mentioned in any op are kept as-is.
+- Prefer UPDATE over ADD+DELETE pairs when a candidate clearly supersedes one specific fact (e.g. "lives in Berlin" → "lives in Lisbon").
+- Prefer DROP over UPDATE when the candidate adds no real information ("works at Stripe" candidate when existing fact already says "works at Stripe as a backend engineer").
+- For UPDATE: copy the candidate's content/category/confidence verbatim into the op (these become the new fact's stored values). Do NOT merge or paraphrase.
+- For ADD: same — content/category/confidence come from the candidate.
+- For DELETE: provide a one-sentence reason citing the contradicting candidate.
+- For DROP: provide a one-sentence reason naming the redundant existing fact.
+
+WORKED EXAMPLE.
+Subject: Sam
+Existing facts:
+  [3] (preference, conf=0.85, 30d) Sam loves jazz music, especially Coltrane.
+  [7] (fact, conf=0.90, 60d) Sam lives in Berlin and works at Stripe.
+  [12] (event, conf=0.75, 5d) Sam is going to Umbria Jazz festival in July.
+
+New candidates:
+  [0] (fact, conf=0.92) Sam lives in Lisbon now (moved last month).
+  [1] (preference, conf=0.80) Sam likes jazz.
+  [2] (commitment, conf=0.85) Sam promised to send me her Umbria Jazz photos.
+
+Correct ops:
+  - UPDATE: candidate_index=0, old_fact_id=7 (Sam moved Berlin → Lisbon — the Stripe employer detail is also part of fact 7, but the candidate is silent on it; choose UPDATE because candidate clearly supersedes the location, and re-asserting Stripe without evidence would invent info.)
+  - DROP: candidate_index=1, reason="redundant with fact 3 which already records jazz preference with more detail."
+  - ADD: candidate_index=2 (new commitment, no existing fact covers it).
+
+Return ops strictly as JSON matching the schema.`;
+
+const CONSOLIDATE_SCHEMA_JSON = {
+  type: 'object',
+  properties: {
+    ops: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          op: { type: 'string', enum: ['ADD', 'UPDATE', 'DELETE', 'DROP'] },
+          candidate_index: { type: 'integer' },
+          old_fact_id: { type: 'integer' },
+          content: { type: 'string' },
+          category: { type: 'string', enum: [...FACT_CATEGORIES] },
+          confidence: { type: 'number' },
+          reason: { type: 'string' },
+        },
+        required: ['op'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['ops'],
+  additionalProperties: false,
+} as const;
+
+const ConsolidateZod = z.object({
+  ops: z.array(
+    z.object({
+      op: z.enum(['ADD', 'UPDATE', 'DELETE', 'DROP']),
+      candidate_index: z.number().int().optional(),
+      old_fact_id: z.number().int().optional(),
+      content: z.string().optional(),
+      category: z.enum(FACT_CATEGORIES).optional(),
+      confidence: z.number().min(0).max(1).optional(),
+      reason: z.string().optional(),
     })
   ),
 });
@@ -190,10 +284,10 @@ async function callAgent(args: {
 }
 
 export class ClaudeProvider implements LLMProvider {
-  async filter(input: FilterInput) {
+  async filterBurst(input: BurstInput) {
     const result = await callAgent({
       systemPrompt: FILTER_SYSTEM_PROMPT,
-      userPrompt: formatFilterMessage(input),
+      userPrompt: formatBurstMessage(input, 'filter'),
       model: FILTER_MODEL,
       outputSchema: FILTER_SCHEMA_JSON as unknown as Record<string, unknown>,
     });
@@ -205,10 +299,10 @@ export class ClaudeProvider implements LLMProvider {
     };
   }
 
-  async extract(input: ExtractInput) {
+  async extractBurst(input: BurstInput) {
     const result = await callAgent({
       systemPrompt: EXTRACT_SYSTEM_PROMPT,
-      userPrompt: formatExtractMessage(input),
+      userPrompt: formatBurstMessage(input, 'extract'),
       model: EXTRACT_MODEL,
       outputSchema: EXTRACT_SCHEMA_JSON as unknown as Record<string, unknown>,
     });
@@ -216,6 +310,26 @@ export class ClaudeProvider implements LLMProvider {
     return {
       facts: parsed.facts,
       usage: usageOf(EXTRACT_MODEL, result),
+    };
+  }
+
+  async consolidate(input: ConsolidateInput) {
+    const result = await callAgent({
+      systemPrompt: CONSOLIDATE_SYSTEM_PROMPT,
+      userPrompt: formatConsolidateMessage(input),
+      model: CONSOLIDATE_MODEL,
+      outputSchema: CONSOLIDATE_SCHEMA_JSON as unknown as Record<string, unknown>,
+    });
+    const parsed = ConsolidateZod.parse(result.structured);
+
+    const ops: ConsolidationOp[] = [];
+    for (const raw of parsed.ops) {
+      const validated = validateOp(raw, input);
+      if (validated) ops.push(validated);
+    }
+    return {
+      ops,
+      usage: usageOf(CONSOLIDATE_MODEL, result),
     };
   }
 
@@ -312,35 +426,29 @@ export function createLLMProvider(): LLMProvider {
   }
 }
 
-function formatFilterMessage(input: FilterInput): string {
-  const sender = input.senderName ?? input.contactName ?? 'unknown';
-  const lines = [
-    `Contact: ${input.contactName ?? 'unknown'}${input.contactNotes ? ` — ${input.contactNotes}` : ''}`,
-  ];
-  if (input.isGroup) lines.push('Group chat');
-  if (input.recentContext && input.recentContext.length > 0) {
-    lines.push('', 'Recent conversation:');
-    for (const line of input.recentContext) lines.push(`  ${line}`);
-  }
-  lines.push('', `Current message (sent by ${sender}): "${input.body}"`);
-  lines.push('', 'Should this be remembered?');
-  return lines.join('\n');
-}
+function formatBurstMessage(input: BurstInput, mode: 'filter' | 'extract'): string {
+  const contactLabel = input.contactName ?? 'unknown';
+  const startISO = new Date(input.startTs * 1000).toISOString().slice(0, 16).replace('T', ' ');
+  const endISO = new Date(input.endTs * 1000).toISOString().slice(0, 16).replace('T', ' ');
+  const sameDay = startISO.slice(0, 10) === endISO.slice(0, 10);
+  const span = sameDay ? `${startISO} → ${endISO.slice(11)}` : `${startISO} → ${endISO}`;
 
-function formatExtractMessage(input: ExtractInput): string {
-  const dateISO = new Date(input.ts * 1000).toISOString().slice(0, 10);
-  const sender = input.senderName ?? input.contactName ?? 'unknown';
   const lines = [
-    `Date: ${dateISO}`,
-    `Contact: ${input.contactName ?? 'unknown'}${input.contactNotes ? ` — ${input.contactNotes}` : ''}`,
+    `Contact: ${contactLabel}${input.contactNotes ? ` — ${input.contactNotes}` : ''}`,
+    `Burst span: ${span} UTC (${input.lines.length} messages)`,
   ];
   if (input.isGroup) lines.push('Group chat');
-  if (input.recentContext && input.recentContext.length > 0) {
-    lines.push('', 'Recent conversation:');
-    for (const line of input.recentContext) lines.push(`  ${line}`);
+  lines.push('', 'Conversation burst:');
+  for (const line of input.lines) {
+    const sender = line.direction === 'out' ? 'me' : contactLabel;
+    lines.push(`  ${sender}: ${line.body}`);
   }
-  lines.push('', `Current message (sent by ${sender}): "${input.body}"`);
-  lines.push('', 'Extract facts from the current message.');
+  lines.push('');
+  if (mode === 'filter') {
+    lines.push('Does this burst contain anything worth remembering?');
+  } else {
+    lines.push('Extract facts from this burst.');
+  }
   return lines.join('\n');
 }
 
@@ -350,6 +458,84 @@ function usageOf(model: string, result: AgentCallResult): UsageMetadata {
     tokens_in: result.tokens_in,
     tokens_out: result.tokens_out,
   };
+}
+
+function formatConsolidateMessage(input: ConsolidateInput): string {
+  const lines = [`Subject: ${input.subject}`, '', 'Existing facts:'];
+  if (input.existing.length === 0) {
+    lines.push('  (none — every candidate should be ADD)');
+  } else {
+    for (const f of input.existing) {
+      lines.push(
+        `  [${f.id}] (${f.category}, conf=${f.confidence.toFixed(2)}, ${Math.round(f.age_days)}d) ${f.content}`
+      );
+    }
+  }
+  lines.push('', 'New candidates:');
+  for (let i = 0; i < input.candidates.length; i++) {
+    const c = input.candidates[i];
+    lines.push(`  [${i}] (${c.category}, conf=${c.confidence.toFixed(2)}) ${c.content}`);
+  }
+  lines.push('', 'Decide ops for each candidate. Return JSON.');
+  return lines.join('\n');
+}
+
+/**
+ * Reject malformed ops (missing required fields for the chosen op type) and
+ * out-of-range candidate/fact references. Returning null silently drops one
+ * op rather than failing the whole burst — better than nothing, and any
+ * dropped candidate will simply be re-extracted next time the same content
+ * appears.
+ */
+function validateOp(
+  raw: z.infer<typeof ConsolidateZod>['ops'][number],
+  input: ConsolidateInput
+): ConsolidationOp | null {
+  const candIdxOk =
+    raw.candidate_index !== undefined &&
+    raw.candidate_index >= 0 &&
+    raw.candidate_index < input.candidates.length;
+  const oldIdOk =
+    raw.old_fact_id !== undefined &&
+    input.existing.some((e) => e.id === raw.old_fact_id);
+
+  switch (raw.op) {
+    case 'ADD':
+      if (!candIdxOk || !raw.content || !raw.category || raw.confidence === undefined) return null;
+      return {
+        op: 'ADD',
+        candidate_index: raw.candidate_index!,
+        content: raw.content,
+        category: raw.category,
+        confidence: raw.confidence,
+      };
+    case 'UPDATE':
+      if (!candIdxOk || !oldIdOk || !raw.content || !raw.category || raw.confidence === undefined) {
+        return null;
+      }
+      return {
+        op: 'UPDATE',
+        candidate_index: raw.candidate_index!,
+        old_fact_id: raw.old_fact_id!,
+        content: raw.content,
+        category: raw.category,
+        confidence: raw.confidence,
+      };
+    case 'DELETE':
+      if (!oldIdOk) return null;
+      return {
+        op: 'DELETE',
+        old_fact_id: raw.old_fact_id!,
+        reason: raw.reason ?? '(no reason given)',
+      };
+    case 'DROP':
+      if (!candIdxOk) return null;
+      return {
+        op: 'DROP',
+        candidate_index: raw.candidate_index!,
+        reason: raw.reason ?? '(no reason given)',
+      };
+  }
 }
 
 function formatChatMessage(input: ChatInput): string {

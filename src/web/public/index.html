@@ -130,6 +130,63 @@
       font-size: 12px; color: var(--muted); margin-top: 6px;
       padding-top: 6px; border-top: 1px solid var(--border); font-style: italic;
     }
+
+    /* IMPORT */
+    #import-view { padding: 24px; max-width: 720px; margin: 0 auto; width: 100%; }
+    #import-view h2 { font-size: 18px; font-weight: 600; margin: 0 0 6px; }
+    #import-view .help {
+      color: var(--muted); margin-bottom: 24px; font-size: 13px; line-height: 1.6;
+    }
+    #import-form {
+      display: flex; flex-direction: column; gap: 16px;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 20px;
+    }
+    .field { display: flex; flex-direction: column; gap: 6px; }
+    .field label {
+      font-size: 12px; color: var(--muted); font-weight: 500;
+      text-transform: uppercase; letter-spacing: 0.05em;
+    }
+    .field input, .field select {
+      padding: 10px 12px; border-radius: var(--radius);
+      background: var(--panel-2); border: 1px solid var(--border); color: var(--fg);
+      font: inherit;
+    }
+    .field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
+    .field input[type="file"] { padding: 8px; cursor: pointer; }
+    .field .hint { font-size: 11px; color: var(--muted); }
+    #import-submit {
+      align-self: flex-start;
+      padding: 10px 24px; border-radius: var(--radius);
+      background: var(--accent); color: #0e0e10; border: none; font: inherit; font-weight: 600;
+      cursor: pointer;
+    }
+    #import-submit:disabled { opacity: 0.5; cursor: not-allowed; }
+    #import-result {
+      margin-top: 20px; padding: 16px;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+    #import-result.success { border-color: var(--accent); }
+    #import-result.error { border-color: var(--danger); }
+    #import-result.hidden { display: none; }
+    #import-result h3 { margin: 0 0 8px; font-size: 14px; }
+    #import-result.success h3 { color: var(--accent); }
+    #import-result.error h3 { color: var(--danger); }
+    #import-result dl {
+      display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px;
+      margin: 8px 0 0; font-size: 13px;
+    }
+    #import-result dt { color: var(--muted); }
+    #import-result dd { margin: 0; color: var(--fg); font-variant-numeric: tabular-nums; }
+    #import-result .next-step {
+      margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);
+      font-size: 13px; color: var(--muted);
+    }
+    #import-result code {
+      background: var(--panel-2); padding: 2px 6px; border-radius: 4px;
+      color: var(--accent); font-family: "SF Mono", ui-monospace, monospace;
+    }
   </style>
 </head>
 <body>
@@ -138,6 +195,7 @@
     <nav>
       <button data-view="chat" class="active">Chat</button>
       <button data-view="facts">Facts</button>
+      <button data-view="import">Import</button>
     </nav>
   </header>
 
@@ -164,6 +222,36 @@
       <div id="facts-summary"></div>
       <div id="facts-list"></div>
     </section>
+
+    <section id="import-view" class="view">
+      <h2>Import a WhatsApp chat export</h2>
+      <p class="help">
+        On your phone: WhatsApp → open the chat → ⋮ / contact name → <em>Export Chat</em> → <em>Without media</em>.
+        Send the resulting <code>_chat.txt</code> to yourself, drop it here, and it'll be parsed and ingested.
+        Run <code>npm run process</code> after to extract facts.
+      </p>
+      <form id="import-form">
+        <div class="field">
+          <label for="import-file">_chat.txt</label>
+          <input type="file" id="import-file" accept=".txt,text/plain" required />
+          <span class="hint" id="import-file-info"></span>
+        </div>
+        <div class="field">
+          <label for="import-wa-id">Contact (from whitelist)</label>
+          <select id="import-wa-id" required>
+            <option value="">Loading…</option>
+          </select>
+          <span class="hint">Edit <code>config/whitelist.json</code> to add contacts. Restart not required — the list reloads on each request.</span>
+        </div>
+        <div class="field">
+          <label for="import-me">Your display name in the export</label>
+          <input type="text" id="import-me" required placeholder="your name as it appears in the export" autocomplete="off" />
+          <span class="hint">Must match exactly how your name appears as the sender in the .txt file (case-sensitive).</span>
+        </div>
+        <button type="submit" id="import-submit">Import</button>
+      </form>
+      <div id="import-result" class="hidden"></div>
+    </section>
   </main>
 
   <script>
@@ -176,6 +264,7 @@
         $$('nav button').forEach((b) => b.classList.toggle('active', b === btn));
         $$('.view').forEach((v) => v.classList.toggle('active', v.id === btn.dataset.view + '-view'));
         if (btn.dataset.view === 'facts') loadFacts();
+        if (btn.dataset.view === 'import') loadWhitelistOptions();
       });
     });
 
@@ -335,6 +424,125 @@
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
       })[c]);
     }
+
+    // ---- import ----
+    const importForm = $('#import-form');
+    const importFile = $('#import-file');
+    const importFileInfo = $('#import-file-info');
+    const importWaSelect = $('#import-wa-id');
+    const importMe = $('#import-me');
+    const importSubmit = $('#import-submit');
+    const importResult = $('#import-result');
+
+    let whitelistLoaded = false;
+
+    async function loadWhitelistOptions() {
+      if (whitelistLoaded) return;
+      try {
+        const r = await fetch('/api/whitelist');
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'failed to load whitelist');
+        importWaSelect.innerHTML = '';
+        if (!data.entries || data.entries.length === 0) {
+          const opt = document.createElement('option');
+          opt.value = '';
+          opt.textContent = '(whitelist is empty — add an entry to config/whitelist.json)';
+          opt.disabled = true;
+          opt.selected = true;
+          importWaSelect.appendChild(opt);
+          return;
+        }
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Select a contact…';
+        placeholder.disabled = true;
+        placeholder.selected = true;
+        importWaSelect.appendChild(placeholder);
+        for (const e of data.entries) {
+          const opt = document.createElement('option');
+          opt.value = e.wa_id;
+          opt.textContent = e.display_name ? `${e.display_name} (${e.wa_id})` : e.wa_id;
+          importWaSelect.appendChild(opt);
+        }
+        whitelistLoaded = true;
+      } catch (err) {
+        importWaSelect.innerHTML = `<option value="" disabled selected>error: ${escapeHtml(err.message)}</option>`;
+      }
+    }
+
+    importFile.addEventListener('change', () => {
+      const f = importFile.files && importFile.files[0];
+      importFileInfo.textContent = f ? `${f.name} — ${(f.size / 1024).toFixed(1)} KB` : '';
+    });
+
+    function readFileText(file) {
+      return new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => resolve(String(r.result));
+        r.onerror = () => reject(r.error || new Error('FileReader failed'));
+        r.readAsText(file, 'utf-8');
+      });
+    }
+
+    function showImportResult(success, title, statsOrError) {
+      importResult.classList.remove('hidden', 'success', 'error');
+      importResult.classList.add(success ? 'success' : 'error');
+      if (!success) {
+        importResult.innerHTML = `<h3>${escapeHtml(title)}</h3><p></p>`;
+        importResult.querySelector('p').textContent = String(statsOrError);
+        return;
+      }
+      const s = statsOrError;
+      const cutoff = s.live_cutoff_ts ? new Date(s.live_cutoff_ts * 1000).toLocaleString() : '—';
+      importResult.innerHTML = `
+        <h3>${escapeHtml(title)}</h3>
+        <dl>
+          <dt>parsed headers</dt><dd>${s.parse.total}</dd>
+          <dt>text messages</dt><dd>${s.parse.text}</dd>
+          <dt>media (skipped at burst time)</dt><dd>${s.parse.media}</dd>
+          <dt>system / empty (skipped)</dt><dd>${s.parse.skipped_system + s.parse.skipped_empty}</dd>
+          <dt>inserted</dt><dd>${s.inserted}</dd>
+          <dt>duplicate (collapsed)</dt><dd>${s.duplicate}</dd>
+          <dt>bursts (rebuilt across DB)</dt><dd>${s.bursts} burst(s) covering ${s.burst_messages} text msg(s)</dd>
+          <dt>live cutoff</dt><dd>${escapeHtml(cutoff)}</dd>
+        </dl>
+        <div class="next-step">
+          Now run <code>npm run process</code> in your terminal to filter, extract, and consolidate facts from the new bursts.
+        </div>
+      `;
+    }
+
+    importForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const file = importFile.files && importFile.files[0];
+      const waId = importWaSelect.value;
+      const me = importMe.value.trim();
+      if (!file || !waId || !me) return;
+
+      importSubmit.disabled = true;
+      importResult.classList.remove('hidden', 'success', 'error');
+      importResult.classList.add('success');
+      importResult.innerHTML = '<h3>Uploading and parsing…</h3>';
+
+      try {
+        const content = await readFileText(file);
+        const r = await fetch('/api/import-chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content, waId, me }),
+        });
+        const data = await r.json();
+        if (!r.ok) {
+          showImportResult(false, 'Import failed', data.error || 'request failed');
+          return;
+        }
+        showImportResult(true, 'Import complete', data.stats);
+      } catch (err) {
+        showImportResult(false, 'Import failed', err.message);
+      } finally {
+        importSubmit.disabled = false;
+      }
+    });
 
     // initial focus
     input.focus();

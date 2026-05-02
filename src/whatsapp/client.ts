@@ -10,6 +10,7 @@ export interface WAClientOptions {
 export function createWAClient(opts: WAClientOptions): Client {
   const client = new Client({
     authStrategy: new LocalAuth({
+      clientId: 'manila',
       dataPath: path.resolve(opts.sessionPath),
     }),
     puppeteer: {

@@ -1,25 +1,21 @@
-export interface FilterInput {
+export interface BurstLine {
+  direction: 'in' | 'out';
   body: string;
+  ts: number;
+}
+
+export interface BurstInput {
   contactName?: string | null;
   contactNotes?: string | null;
   isGroup?: boolean;
-  senderName?: string | null;
-  recentContext?: string[];
+  startTs: number;
+  endTs: number;
+  lines: BurstLine[];
 }
 
 export interface FilterResult {
   keep: boolean;
   reason: string;
-}
-
-export interface ExtractInput {
-  body: string;
-  contactName?: string | null;
-  contactNotes?: string | null;
-  ts: number;
-  isGroup?: boolean;
-  senderName?: string | null;
-  recentContext?: string[];
 }
 
 export type FactCategory = 'preference' | 'event' | 'commitment' | 'fact' | 'relationship';
@@ -50,9 +46,32 @@ export interface ChatInput {
 
 export type EmbedMode = 'document' | 'query';
 
+export interface ExistingFact {
+  id: number;
+  content: string;
+  category: string;
+  confidence: number;
+  age_days: number;
+}
+
+export interface ConsolidateInput {
+  subject: string;
+  existing: ExistingFact[];
+  candidates: ExtractedFact[];
+}
+
+export type ConsolidationOp =
+  | { op: 'ADD'; candidate_index: number; content: string; category: FactCategory; confidence: number }
+  | { op: 'UPDATE'; candidate_index: number; old_fact_id: number; content: string; category: FactCategory; confidence: number }
+  | { op: 'DELETE'; old_fact_id: number; reason: string }
+  | { op: 'DROP'; candidate_index: number; reason: string };
+
 export interface LLMProvider {
-  filter(input: FilterInput): Promise<FilterResult & { usage: UsageMetadata }>;
-  extract(input: ExtractInput): Promise<{ facts: ExtractedFact[]; usage: UsageMetadata }>;
+  filterBurst(input: BurstInput): Promise<FilterResult & { usage: UsageMetadata }>;
+  extractBurst(input: BurstInput): Promise<{ facts: ExtractedFact[]; usage: UsageMetadata }>;
+  consolidate(
+    input: ConsolidateInput
+  ): Promise<{ ops: ConsolidationOp[]; usage: UsageMetadata }>;
   embed(text: string, mode?: EmbedMode): Promise<{ vector: number[]; usage: UsageMetadata }>;
   chat(input: ChatInput): Promise<{ answer: string; usage: UsageMetadata }>;
 }

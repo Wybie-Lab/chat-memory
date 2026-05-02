@@ -8,15 +8,15 @@ async function main() {
   const db = openDb(dbPath);
   const provider = createLLMProvider();
 
-  console.log('processing all unprocessed messages...\n');
+  console.log('processing all unprocessed bursts...\n');
 
   const stats = await processUntilDrained(db, provider, {
-    batchSize: 10,
+    batchSize: 5,
     log: (line) => console.log(line),
   });
 
   console.log(
-    `\ndone — scanned=${stats.scanned} kept=${stats.kept} dropped=${stats.dropped} facts=${stats.facts} errors=${stats.errors}`
+    `\ndone — bursts=${stats.bursts_scanned} kept=${stats.bursts_kept}/dropped=${stats.bursts_dropped} | facts: +${stats.facts_added} updated=${stats.facts_updated} deleted=${stats.facts_deleted} dup=${stats.facts_dropped} guarded=${stats.facts_guarded} | errors=${stats.errors}`
   );
 
   process.exit(0);
