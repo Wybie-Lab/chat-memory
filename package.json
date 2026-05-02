@@ -11,6 +11,7 @@
     "process": "tsx scripts/process.ts",
     "reset-pipeline": "tsx scripts/reset-pipeline.ts",
     "web": "tsx src/web/server.ts",
+    "eval": "tsx scripts/eval.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
