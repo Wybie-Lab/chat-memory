@@ -1,6 +1,11 @@
 import 'dotenv/config';
 import { createWAClient } from '../src/whatsapp/client';
-import { openDb, upsertContact, insertRawMessage } from '../src/memory/db';
+import {
+  openDb,
+  upsertContact,
+  insertRawMessage,
+  rebuildAllBursts,
+} from '../src/memory/db';
 import { loadWhitelist, syncWhitelistToDb } from '../src/config/whitelist';
 
 async function main() {
@@ -24,6 +29,21 @@ async function main() {
   console.log(`backfilling last ${days} days for ${whitelist.size()} chat(s)...`);
 
   const client = createWAClient({ sessionPath });
+
+  let shuttingDown = false;
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n${signal} received — closing WhatsApp session cleanly...`);
+    try {
+      await client.destroy();
+    } catch (err) {
+      console.error('destroy error:', err instanceof Error ? err.message : err);
+    }
+    process.exit(130);
+  };
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
   await new Promise<void>((resolve, reject) => {
     client.once('ready', () => resolve());
@@ -91,6 +111,12 @@ async function main() {
 
   console.log(
     `\ntotal: inserted=${totalInserted} duplicate=${totalDuplicate} older=${totalOlder}`
+  );
+
+  console.log('rebuilding conversation bursts from raw_messages...');
+  const burstStats = rebuildAllBursts(db);
+  console.log(
+    `bursts: ${burstStats.bursts} burst(s) covering ${burstStats.messages} message(s)`
   );
 
   await client.destroy();
