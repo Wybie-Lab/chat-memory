@@ -279,6 +279,47 @@
     .category-tabs button.active {
       background: var(--panel-2); color: var(--fg); border-color: var(--accent);
     }
+    .timeline {
+      display: flex; flex-direction: column; gap: 6px;
+      margin-bottom: 24px;
+    }
+    .timeline-bars {
+      display: flex; align-items: flex-end; gap: 2px; height: 48px;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 8px;
+    }
+    .timeline-bar {
+      flex: 1; min-width: 2px;
+      background: var(--panel-2);
+      border-radius: 2px;
+      cursor: pointer;
+      position: relative;
+      transition: background 0.1s;
+    }
+    .timeline-bar:hover { background: var(--accent); opacity: 0.7; }
+    .timeline-bar.selected { background: var(--accent); }
+    .timeline-bar[data-count="0"] {
+      background: transparent;
+      border-bottom: 1px solid var(--border);
+      cursor: default;
+    }
+    .timeline-bar[data-count="0"]:hover { background: transparent; }
+    .timeline-axis {
+      display: flex; justify-content: space-between;
+      font-size: 10px; color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .timeline-status {
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 12px; color: var(--muted); min-height: 18px;
+    }
+    .timeline-status button {
+      background: transparent; border: 1px solid var(--border);
+      color: var(--muted); padding: 2px 10px; border-radius: 99px;
+      cursor: pointer; font: inherit; font-size: 11px;
+    }
+    .timeline-status button:hover { color: var(--fg); border-color: var(--accent); }
+
     .superseded-section {
       margin-top: 24px;
       background: var(--panel); border: 1px solid var(--border);
@@ -842,6 +883,82 @@
         `${subject.active_fact_count} facts · last updated ${ago}`;
       wrap.appendChild(header);
 
+      // Timeline strip — fact density by month, click to filter facts to a month.
+      // Derives buckets from the already-fetched facts list (no extra round-trip).
+      const monthBuckets = bucketFactsByMonth(facts);
+      let selectedMonth = null;  // null = show all; 'YYYY-MM' = filter
+      let paintListImpl = null;  // assigned by the active-facts block below
+
+      if (monthBuckets.length > 0) {
+        const tWrap = document.createElement('div');
+        tWrap.className = 'timeline';
+        const status = document.createElement('div');
+        status.className = 'timeline-status';
+        status.innerHTML = '<span class="t-label"></span><button class="t-clear" hidden>Clear filter</button>';
+        const bars = document.createElement('div');
+        bars.className = 'timeline-bars';
+        const axis = document.createElement('div');
+        axis.className = 'timeline-axis';
+
+        const maxCount = Math.max(...monthBuckets.map((b) => b.count));
+        const minHeightPct = 8;  // make 1-fact bars still visible
+
+        function paintBars() {
+          bars.innerHTML = '';
+          for (const b of monthBuckets) {
+            const bar = document.createElement('div');
+            bar.className = 'timeline-bar';
+            bar.dataset.count = String(b.count);
+            bar.dataset.month = b.month;
+            const pct = b.count === 0 ? 0 : minHeightPct + (1 - minHeightPct / 100) * (b.count / maxCount) * 100;
+            bar.style.height = pct + '%';
+            bar.title = `${b.month} · ${b.count} fact${b.count === 1 ? '' : 's'}`;
+            if (selectedMonth === b.month) bar.classList.add('selected');
+            if (b.count > 0) {
+              bar.addEventListener('click', () => {
+                selectedMonth = selectedMonth === b.month ? null : b.month;
+                paintBars();
+                updateStatus();
+                if (paintListImpl) paintListImpl();
+              });
+            }
+            bars.appendChild(bar);
+          }
+        }
+        function updateStatus() {
+          status.querySelector('.t-label').textContent = selectedMonth
+            ? `Filtered: ${selectedMonth} (${monthBuckets.find((b) => b.month === selectedMonth)?.count ?? 0} fact${
+                (monthBuckets.find((b) => b.month === selectedMonth)?.count ?? 0) === 1 ? '' : 's'
+              })`
+            : `Timeline: ${monthBuckets[0].month} → ${monthBuckets[monthBuckets.length - 1].month} · click a month to filter`;
+          status.querySelector('.t-clear').hidden = selectedMonth === null;
+        }
+        status.querySelector('.t-clear').addEventListener('click', () => {
+          selectedMonth = null;
+          paintBars();
+          updateStatus();
+          if (paintListImpl) paintListImpl();
+        });
+
+        // Axis labels: first, middle, last
+        const first = monthBuckets[0].month;
+        const last = monthBuckets[monthBuckets.length - 1].month;
+        const mid = monthBuckets[Math.floor(monthBuckets.length / 2)].month;
+        axis.innerHTML = `<span>${first}</span><span>${mid}</span><span>${last}</span>`;
+
+        paintBars();
+        updateStatus();
+        tWrap.appendChild(status);
+        tWrap.appendChild(bars);
+        tWrap.appendChild(axis);
+        wrap.appendChild(tWrap);
+
+        // Expose the selected-month getter to paintList
+        renderSubjectDetail._getMonth = () => selectedMonth;
+      } else {
+        renderSubjectDetail._getMonth = () => null;
+      }
+
       if (cluster_summaries.length) {
         const t = document.createElement('div');
         t.className = 'section-title';
@@ -903,10 +1020,19 @@
           }
         }
         function paintList() {
-          const subset = activeCat === 'all' ? facts : byCategory.get(activeCat);
+          let subset = activeCat === 'all' ? facts : byCategory.get(activeCat);
+          const month = renderSubjectDetail._getMonth ? renderSubjectDetail._getMonth() : null;
+          if (month) {
+            subset = subset.filter((f) => factMonth(f) === month);
+          }
           factsListEl.innerHTML = '';
+          if (subset.length === 0) {
+            factsListEl.innerHTML = '<div class="empty"><p>No facts in this slice.</p></div>';
+            return;
+          }
           for (const f of subset) factsListEl.appendChild(renderFactCard(f));
         }
+        paintListImpl = paintList;
         paintTabs();
         paintList();
         wrap.appendChild(tabsWrap);
@@ -1033,6 +1159,36 @@
         });
       });
       loadFacts();
+    }
+
+    function factMonth(f) {
+      // Anchor on event_ts when set so future events sit in their own month;
+      // otherwise extracted_at (when we learned about it).
+      const ts = f.event_ts ?? f.extracted_at;
+      const d = new Date(ts * 1000);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    }
+
+    function bucketFactsByMonth(facts) {
+      // Build a contiguous month list spanning min..max so the bar chart shows
+      // gaps as empty bars (more truthful than skipping silent months).
+      if (facts.length === 0) return [];
+      const months = facts.map(factMonth);
+      const counts = new Map();
+      for (const m of months) counts.set(m, (counts.get(m) || 0) + 1);
+      const sorted = [...counts.keys()].sort();
+      const first = sorted[0];
+      const last = sorted[sorted.length - 1];
+      const out = [];
+      let [y, m] = first.split('-').map(Number);
+      const [yEnd, mEnd] = last.split('-').map(Number);
+      while (y < yEnd || (y === yEnd && m <= mEnd)) {
+        const key = `${y}-${String(m).padStart(2, '0')}`;
+        out.push({ month: key, count: counts.get(key) || 0 });
+        m++;
+        if (m > 12) { m = 1; y++; }
+      }
+      return out;
     }
 
     function relativeAgo(ts) {
