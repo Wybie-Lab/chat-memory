@@ -188,17 +188,135 @@
     #chat-form button:disabled { opacity: 0.5; cursor: not-allowed; }
     .typing { color: var(--muted); font-style: italic; }
 
-    /* FACTS */
-    #facts-view { padding: 24px; max-width: 1200px; margin: 0 auto; width: 100%; }
-    .filters {
+    /* FACTS — subject-centric layout */
+    #facts-view {
+      padding: 0; flex-direction: row; min-height: 0;
+    }
+    .subjects-sidebar {
+      width: 280px; flex-shrink: 0;
+      border-right: 1px solid var(--border);
+      background: var(--panel);
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+    .subjects-sidebar input {
+      margin: 12px; padding: 8px 12px;
+      border-radius: var(--radius);
+      background: var(--panel-2); border: 1px solid var(--border); color: var(--fg);
+      font: inherit;
+    }
+    .subjects-sidebar input:focus { outline: none; border-color: var(--accent); }
+    #subjects-list {
+      list-style: none; margin: 0; padding: 0 8px 12px;
+      overflow-y: auto; flex: 1;
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    #subjects-list li {
+      padding: 8px 12px; cursor: pointer; border-radius: 6px;
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    #subjects-list li:hover { background: var(--panel-2); }
+    #subjects-list li.selected {
+      background: var(--panel-2); border-left: 2px solid var(--accent);
+      padding-left: 10px;
+    }
+    #subjects-list li .s-name { color: var(--fg); font-weight: 500; font-size: 13px; }
+    #subjects-list li .s-meta {
+      color: var(--muted); font-size: 11px;
+      display: flex; justify-content: space-between; gap: 8px;
+      font-variant-numeric: tabular-nums;
+    }
+    #subjects-list li.all-facts .s-name { color: var(--accent); }
+    #facts-detail {
+      flex: 1; overflow-y: auto; padding: 24px; max-width: 100%;
+    }
+    .subject-header {
+      display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+      margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border);
+    }
+    .subject-header h2 {
+      margin: 0; font-size: 22px; font-weight: 600; color: var(--fg);
+    }
+    .subject-header .s-wa-id {
+      font-family: "SF Mono", ui-monospace, monospace;
+      font-size: 12px; color: var(--muted);
+      background: var(--panel-2); padding: 2px 8px; border-radius: 4px;
+    }
+    .subject-header .s-meta-line {
+      color: var(--muted); font-size: 13px; flex: 1;
+    }
+    .section-title {
+      font-size: 11px; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;
+      margin: 24px 0 8px;
+    }
+    .section-title:first-child { margin-top: 0; }
+    .cluster-card {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 12px 16px; margin-bottom: 8px;
+    }
+    .cluster-card .c-cat {
+      display: inline-block;
+      padding: 2px 8px; border-radius: 4px; background: var(--panel-2);
+      text-transform: uppercase; font-size: 10px; letter-spacing: 0.05em;
+      color: var(--muted); margin-bottom: 6px;
+    }
+    .cluster-card .c-summary { color: var(--fg); }
+    .cluster-card .c-meta {
+      font-size: 11px; color: var(--muted); margin-top: 6px;
+      font-variant-numeric: tabular-nums;
+    }
+    .category-tabs {
+      display: flex; gap: 4px; margin-bottom: 12px; flex-wrap: wrap;
+    }
+    .category-tabs button {
+      background: transparent; border: 1px solid var(--border);
+      color: var(--muted); padding: 4px 12px; border-radius: 99px;
+      cursor: pointer; font: inherit; font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .category-tabs button:hover { color: var(--fg); }
+    .category-tabs button.active {
+      background: var(--panel-2); color: var(--fg); border-color: var(--accent);
+    }
+    .superseded-section {
+      margin-top: 24px;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: var(--radius); overflow: hidden;
+    }
+    .superseded-section summary {
+      padding: 12px 16px; cursor: pointer; color: var(--muted);
+      list-style: none; user-select: none;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .superseded-section summary::-webkit-details-marker { display: none; }
+    .superseded-section summary::before {
+      content: '▸'; transition: transform 0.15s;
+    }
+    .superseded-section[open] summary::before { transform: rotate(90deg); }
+    .superseded-section summary:hover { background: var(--panel-2); }
+    .superseded-list { padding: 0 16px 12px; }
+    .superseded-item {
+      padding: 10px 0; border-top: 1px solid var(--border);
+      font-size: 13px;
+    }
+    .superseded-item:first-child { border-top: 0; }
+    .superseded-item .old { color: var(--muted); text-decoration: line-through; }
+    .superseded-item .new { color: var(--fg); }
+    .superseded-item .arrow { color: var(--accent); margin: 0 6px; }
+    .superseded-item .deleted-tag {
+      color: var(--danger); font-size: 11px; margin-left: 6px;
+    }
+    .all-facts-pane .filters {
       display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap;
     }
-    .filters input, .filters select {
+    .all-facts-pane .filters input,
+    .all-facts-pane .filters select {
       padding: 8px 12px; border-radius: var(--radius);
       background: var(--panel-2); border: 1px solid var(--border); color: var(--fg);
       font: inherit;
     }
-    .filters input { flex: 1; min-width: 200px; }
+    .all-facts-pane .filters input { flex: 1; min-width: 200px; }
     #facts-summary { color: var(--muted); margin-bottom: 12px; font-size: 13px; }
     .fact {
       background: var(--panel); border: 1px solid var(--border);
@@ -322,13 +440,15 @@
     </section>
 
     <section id="facts-view" class="view">
-      <div class="filters">
-        <input type="text" id="filter-q" placeholder="Search content..." />
-        <input type="text" id="filter-subject" placeholder="Subject (e.g. Emma)" />
-        <select id="filter-category"><option value="">All categories</option></select>
+      <aside class="subjects-sidebar">
+        <input type="text" id="subject-search" placeholder="Search subjects..." autocomplete="off" />
+        <ul id="subjects-list">
+          <!-- populated by JS; first entry is "All facts" -->
+        </ul>
+      </aside>
+      <div id="facts-detail">
+        <!-- populated by JS based on selection -->
       </div>
-      <div id="facts-summary"></div>
-      <div id="facts-list"></div>
     </section>
 
     <section id="import-view" class="view">
@@ -374,7 +494,7 @@
       btn.addEventListener('click', () => {
         $$('nav button').forEach((b) => b.classList.toggle('active', b === btn));
         $$('.view').forEach((v) => v.classList.toggle('active', v.id === btn.dataset.view + '-view'));
-        if (btn.dataset.view === 'facts') loadFacts();
+        if (btn.dataset.view === 'facts') loadSubjects();
         if (btn.dataset.view === 'import') loadWhitelistOptions();
       });
     });
@@ -614,90 +734,314 @@
       }
     });
 
-    // ---- facts ----
-    const factsListEl = $('#facts-list');
-    const factsSummaryEl = $('#facts-summary');
-    const filterQ = $('#filter-q');
-    const filterSubject = $('#filter-subject');
-    const filterCategory = $('#filter-category');
+    // ---- facts (subject-centric) ----
+    const subjectsListEl = $('#subjects-list');
+    const subjectSearchEl = $('#subject-search');
+    const factsDetailEl = $('#facts-detail');
 
-    let factsLoadTimer;
-    [filterQ, filterSubject, filterCategory].forEach((el) => {
-      el.addEventListener('input', () => {
-        clearTimeout(factsLoadTimer);
-        factsLoadTimer = setTimeout(loadFacts, 200);
-      });
-    });
+    let subjectsCache = [];
+    let selectedSubject = null;   // null = none yet, 'all' = global, '<wa_id>' = subject
 
-    let categoriesPopulated = false;
-
-    async function loadFacts() {
-      const params = new URLSearchParams();
-      if (filterQ.value.trim()) params.set('q', filterQ.value.trim());
-      if (filterSubject.value.trim()) params.set('subject', filterSubject.value.trim());
-      if (filterCategory.value) params.set('category', filterCategory.value);
-
-      factsSummaryEl.textContent = 'loading...';
+    async function loadSubjects() {
       try {
-        const r = await fetch('/api/facts?' + params.toString());
+        const r = await fetch('/api/subjects');
         const data = await r.json();
         if (!r.ok) throw new Error(data.error || 'request failed');
-
-        if (!categoriesPopulated && data.categories.length) {
-          for (const cat of data.categories) {
-            const opt = document.createElement('option');
-            opt.value = cat;
-            opt.textContent = cat;
-            filterCategory.appendChild(opt);
+        subjectsCache = data.subjects;
+        renderSubjectsSidebar();
+        if (selectedSubject === null) selectSubject('all');
+        else if (selectedSubject !== 'all') {
+          // Re-fetch detail in case the subject's facts changed (pipeline still
+          // running). If subject vanished, fall back to All.
+          if (subjectsCache.some((s) => s.subject_wa_id === selectedSubject)) {
+            selectSubject(selectedSubject);
+          } else {
+            selectSubject('all');
           }
-          categoriesPopulated = true;
         }
-
-        renderFacts(data.facts);
       } catch (err) {
-        factsSummaryEl.textContent = 'error: ' + err.message;
-        factsListEl.innerHTML = '';
+        subjectsListEl.innerHTML = `<li>error: ${escapeHtml(err.message)}</li>`;
       }
     }
 
-    function renderFacts(facts) {
-      factsSummaryEl.textContent = `${facts.length} facts`;
-      if (!facts.length) {
-        factsListEl.innerHTML = '<div class="empty"><h2>No facts match your filters</h2></div>';
+    subjectSearchEl.addEventListener('input', renderSubjectsSidebar);
+
+    function renderSubjectsSidebar() {
+      const filter = subjectSearchEl.value.trim().toLowerCase();
+      subjectsListEl.innerHTML = '';
+
+      const total = subjectsCache.reduce((a, s) => a + s.active_fact_count, 0);
+      const allLi = document.createElement('li');
+      allLi.className = 'all-facts';
+      if (selectedSubject === 'all') allLi.classList.add('selected');
+      allLi.innerHTML = `
+        <span class="s-name">All facts</span>
+        <span class="s-meta"><span></span><span class="s-count"></span></span>
+      `;
+      allLi.querySelector('.s-count').textContent = `${total} total`;
+      allLi.addEventListener('click', () => selectSubject('all'));
+      subjectsListEl.appendChild(allLi);
+
+      for (const s of subjectsCache) {
+        const labelLower = (s.display_name || s.subject_wa_id).toLowerCase();
+        if (filter && !labelLower.includes(filter) && !s.subject_wa_id.toLowerCase().includes(filter)) {
+          continue;
+        }
+        const li = document.createElement('li');
+        if (selectedSubject === s.subject_wa_id) li.classList.add('selected');
+        li.innerHTML = `
+          <span class="s-name"></span>
+          <span class="s-meta"><span class="s-ago"></span><span class="s-count"></span></span>
+        `;
+        li.querySelector('.s-name').textContent = s.display_name || s.subject_wa_id;
+        li.querySelector('.s-ago').textContent = s.last_updated_ts ? relativeAgo(s.last_updated_ts) : '—';
+        li.querySelector('.s-count').textContent = `${s.active_fact_count}`;
+        li.addEventListener('click', () => selectSubject(s.subject_wa_id));
+        subjectsListEl.appendChild(li);
+      }
+    }
+
+    async function selectSubject(target) {
+      selectedSubject = target;
+      renderSubjectsSidebar();
+      if (target === 'all') {
+        renderAllFactsPane();
         return;
       }
-
-      factsListEl.innerHTML = '';
-      const nowSec = Date.now() / 1000;
-      for (const f of facts) {
-        const el = document.createElement('div');
-        el.className = 'fact';
-        const ts = new Date(f.source_ts * 1000).toLocaleString();
-        const conf = Math.round(f.confidence * 100);
-        const eventBadge =
-          typeof f.event_ts === 'number' && f.event_ts !== null
-            ? `<span class="fact-event ${f.event_ts > nowSec ? 'future' : 'past'}">📅 ${
-                new Date(f.event_ts * 1000).toISOString().slice(0, 10)
-              }${f.event_ts > nowSec ? ' →' : ''}</span>`
-            : '';
-        el.innerHTML = `
-          <div class="fact-header">
-            <span class="fact-id">#${f.id}</span>
-            <span class="fact-category">${escapeHtml(f.category)}</span>
-            ${eventBadge}
-            <span class="fact-subject">about: <strong></strong></span>
-            <span class="fact-confidence-bar"><span style="width:${conf}%"></span></span>
-            <span>${conf}%</span>
-          </div>
-          <div class="fact-content"></div>
-          <div class="fact-source"></div>
-        `;
-        el.querySelector('.fact-subject strong').textContent = f.subject_wa_id;
-        el.querySelector('.fact-content').textContent = f.content;
-        el.querySelector('.fact-source').textContent =
-          `from ${f.source_direction === 'out' ? 'me' : 'them'} on ${ts}: "${f.source_body}"`;
-        factsListEl.appendChild(el);
+      factsDetailEl.innerHTML = '<div class="empty"><h2>Loading…</h2></div>';
+      try {
+        const r = await fetch('/api/subjects/' + encodeURIComponent(target));
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'request failed');
+        renderSubjectDetail(data);
+      } catch (err) {
+        factsDetailEl.innerHTML = '<div class="empty"></div>';
+        factsDetailEl.querySelector('.empty').innerHTML =
+          `<h2>Error</h2><p>${escapeHtml(err.message)}</p>`;
       }
+    }
+
+    function renderSubjectDetail(data) {
+      const { subject, cluster_summaries, facts, superseded } = data;
+      const name = subject.display_name || subject.subject_wa_id;
+      const ago = subject.last_updated_ts ? relativeAgo(subject.last_updated_ts) : '—';
+
+      factsDetailEl.innerHTML = '';
+      const wrap = document.createElement('div');
+
+      const header = document.createElement('div');
+      header.className = 'subject-header';
+      header.innerHTML = `
+        <h2></h2>
+        <span class="s-wa-id"></span>
+        <span class="s-meta-line"></span>
+      `;
+      header.querySelector('h2').textContent = name;
+      header.querySelector('.s-wa-id').textContent = subject.subject_wa_id;
+      header.querySelector('.s-meta-line').textContent =
+        `${subject.active_fact_count} facts · last updated ${ago}`;
+      wrap.appendChild(header);
+
+      if (cluster_summaries.length) {
+        const t = document.createElement('div');
+        t.className = 'section-title';
+        t.textContent = 'Cluster summaries (what the chat agent reads)';
+        wrap.appendChild(t);
+        for (const c of cluster_summaries) {
+          const card = document.createElement('div');
+          card.className = 'cluster-card';
+          card.innerHTML = `
+            <span class="c-cat"></span>
+            <div class="c-summary"></div>
+            <div class="c-meta"></div>
+          `;
+          card.querySelector('.c-cat').textContent = c.category;
+          card.querySelector('.c-summary').textContent = c.summary;
+          card.querySelector('.c-meta').textContent =
+            `${c.fact_count} facts · refreshed ${relativeAgo(c.last_refreshed_at)}`;
+          wrap.appendChild(card);
+        }
+      }
+
+      const factsTitle = document.createElement('div');
+      factsTitle.className = 'section-title';
+      factsTitle.textContent = 'Active facts';
+      wrap.appendChild(factsTitle);
+
+      if (!facts.length) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.innerHTML = '<p>No active facts.</p>';
+        wrap.appendChild(empty);
+      } else {
+        const tabsWrap = document.createElement('div');
+        tabsWrap.className = 'category-tabs';
+        const factsListEl = document.createElement('div');
+        factsListEl.className = 'fact-list-pane';
+
+        const byCategory = new Map();
+        for (const f of facts) {
+          if (!byCategory.has(f.category)) byCategory.set(f.category, []);
+          byCategory.get(f.category).push(f);
+        }
+        const cats = ['all', ...byCategory.keys()];
+        let activeCat = 'all';
+
+        function paintTabs() {
+          tabsWrap.innerHTML = '';
+          for (const cat of cats) {
+            const btn = document.createElement('button');
+            const count = cat === 'all' ? facts.length : byCategory.get(cat).length;
+            btn.textContent = `${cat} (${count})`;
+            if (cat === activeCat) btn.classList.add('active');
+            btn.addEventListener('click', () => {
+              activeCat = cat;
+              paintTabs();
+              paintList();
+            });
+            tabsWrap.appendChild(btn);
+          }
+        }
+        function paintList() {
+          const subset = activeCat === 'all' ? facts : byCategory.get(activeCat);
+          factsListEl.innerHTML = '';
+          for (const f of subset) factsListEl.appendChild(renderFactCard(f));
+        }
+        paintTabs();
+        paintList();
+        wrap.appendChild(tabsWrap);
+        wrap.appendChild(factsListEl);
+      }
+
+      if (superseded.length) {
+        const det = document.createElement('details');
+        det.className = 'superseded-section';
+        const sum = document.createElement('summary');
+        sum.textContent = `Previously believed (${superseded.length})`;
+        det.appendChild(sum);
+        const list = document.createElement('div');
+        list.className = 'superseded-list';
+        for (const s of superseded) {
+          const item = document.createElement('div');
+          item.className = 'superseded-item';
+          if (s.deleted_at !== null && s.replacement_id === null) {
+            item.innerHTML = '<span class="old"></span><span class="deleted-tag">deleted</span>';
+            item.querySelector('.old').textContent = s.content;
+          } else {
+            item.innerHTML =
+              '<span class="old"></span><span class="arrow">→</span><span class="new"></span>';
+            item.querySelector('.old').textContent = s.content;
+            item.querySelector('.new').textContent = s.replacement_content || '(unknown)';
+          }
+          list.appendChild(item);
+        }
+        det.appendChild(list);
+        wrap.appendChild(det);
+      }
+
+      factsDetailEl.appendChild(wrap);
+    }
+
+    function renderFactCard(f) {
+      const el = document.createElement('div');
+      el.className = 'fact';
+      const ts = new Date(f.source_ts * 1000).toLocaleString();
+      const conf = Math.round(f.confidence * 100);
+      const nowSec = Date.now() / 1000;
+      const eventBadge =
+        typeof f.event_ts === 'number' && f.event_ts !== null
+          ? `<span class="fact-event ${f.event_ts > nowSec ? 'future' : 'past'}">📅 ${
+              new Date(f.event_ts * 1000).toISOString().slice(0, 10)
+            }${f.event_ts > nowSec ? ' →' : ''}</span>`
+          : '';
+      el.innerHTML = `
+        <div class="fact-header">
+          <span class="fact-id">#${f.id}</span>
+          <span class="fact-category">${escapeHtml(f.category)}</span>
+          ${eventBadge}
+          <span class="fact-subject">about: <strong></strong></span>
+          <span class="fact-confidence-bar"><span style="width:${conf}%"></span></span>
+          <span>${conf}%</span>
+        </div>
+        <div class="fact-content"></div>
+        <div class="fact-source"></div>
+      `;
+      el.querySelector('.fact-subject strong').textContent = f.subject_wa_id;
+      el.querySelector('.fact-content').textContent = f.content;
+      el.querySelector('.fact-source').textContent =
+        `from ${f.source_direction === 'out' ? 'me' : 'them'} on ${ts}: "${f.source_body}"`;
+      return el;
+    }
+
+    function renderAllFactsPane() {
+      factsDetailEl.innerHTML = `
+        <div class="all-facts-pane">
+          <div class="filters">
+            <input type="text" id="filter-q" placeholder="Search content..." autocomplete="off" />
+            <input type="text" id="filter-subject" placeholder="Subject contains..." autocomplete="off" />
+            <select id="filter-category"><option value="">All categories</option></select>
+          </div>
+          <div id="facts-summary"></div>
+          <div id="facts-list"></div>
+        </div>
+      `;
+      const filterQ = $('#filter-q');
+      const filterSubject = $('#filter-subject');
+      const filterCategory = $('#filter-category');
+      const factsListEl = $('#facts-list');
+      const factsSummaryEl = $('#facts-summary');
+
+      let categoriesPopulated = false;
+      let factsLoadTimer;
+
+      async function loadFacts() {
+        const params = new URLSearchParams();
+        if (filterQ.value.trim()) params.set('q', filterQ.value.trim());
+        if (filterSubject.value.trim()) params.set('subject', filterSubject.value.trim());
+        if (filterCategory.value) params.set('category', filterCategory.value);
+        factsSummaryEl.textContent = 'loading...';
+        try {
+          const r = await fetch('/api/facts?' + params.toString());
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.error || 'request failed');
+          if (!categoriesPopulated && data.categories.length) {
+            for (const cat of data.categories) {
+              const opt = document.createElement('option');
+              opt.value = cat;
+              opt.textContent = cat;
+              filterCategory.appendChild(opt);
+            }
+            categoriesPopulated = true;
+          }
+          factsSummaryEl.textContent = `${data.facts.length} facts`;
+          factsListEl.innerHTML = '';
+          if (!data.facts.length) {
+            factsListEl.innerHTML = '<div class="empty"><h2>No facts match your filters</h2></div>';
+            return;
+          }
+          for (const f of data.facts) factsListEl.appendChild(renderFactCard(f));
+        } catch (err) {
+          factsSummaryEl.textContent = 'error: ' + err.message;
+          factsListEl.innerHTML = '';
+        }
+      }
+
+      [filterQ, filterSubject, filterCategory].forEach((el) => {
+        el.addEventListener('input', () => {
+          clearTimeout(factsLoadTimer);
+          factsLoadTimer = setTimeout(loadFacts, 200);
+        });
+      });
+      loadFacts();
+    }
+
+    function relativeAgo(ts) {
+      const diff = Math.floor(Date.now() / 1000) - ts;
+      if (diff < 60) return 'just now';
+      if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+      if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+      if (diff < 30 * 86400) return `${Math.floor(diff / 86400)}d ago`;
+      return new Date(ts * 1000).toISOString().slice(0, 10);
     }
 
     function escapeHtml(s) {

@@ -7,6 +7,11 @@ import {
   listCategories,
   composeMemoryBlock,
   getBurstQueueStats,
+  allActiveSubjects,
+  getSubjectInfo,
+  factsAboutSubjectWithSource,
+  supersededFactsForSubject,
+  listClusterSummariesForSubject,
 } from '../engine';
 import { createLLMProvider } from '../llm/claude';
 import {
@@ -77,6 +82,32 @@ app.post('/api/chat', async (req: Request, res: Response) => {
       memory_block: composed.block,
       budget: composed.budget,
       usage,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/subjects', (_req: Request, res: Response) => {
+  try {
+    res.json({ subjects: allActiveSubjects(db) });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/subjects/:wa_id', (req: Request<{ wa_id: string }>, res: Response) => {
+  try {
+    const waId = req.params.wa_id;
+    const subject = getSubjectInfo(db, waId);
+    if (!subject) {
+      return res.status(404).json({ error: `no active facts for subject ${waId}` });
+    }
+    res.json({
+      subject,
+      cluster_summaries: listClusterSummariesForSubject(db, waId),
+      facts: factsAboutSubjectWithSource(db, waId),
+      superseded: supersededFactsForSubject(db, waId),
     });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
