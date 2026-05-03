@@ -23,7 +23,10 @@ async function main() {
 
   // Order matters: raw_messages.burst_id and facts.source_* are FK-tracked,
   // so wipe child rows / null out FK columns before deleting parent rows.
+  // cluster_summaries reference fact_ids in JSON — they go stale the moment
+  // facts are deleted, so wipe them too.
   const wipe = db.transaction(() => {
+    db.exec('DELETE FROM cluster_summaries;');
     db.exec('DELETE FROM facts;');
     db.exec('DELETE FROM fact_embeddings;');
     db.exec('DELETE FROM processing_log;');
