@@ -94,12 +94,18 @@ function similarityFromDistance(distance: number): number {
 }
 
 /**
- * Exponential decay over days since extraction. Half-life RECENCY_HALFLIFE_DAYS,
- * so a fact 1 year old scores ~0.5, a brand-new fact scores ~1.0.
+ * Exponential decay around the fact's temporal anchor. Half-life
+ * RECENCY_HALFLIFE_DAYS, symmetric around now: a fact whose event_ts is
+ * 365 days *before or after* now scores ~0.5; one anchored at now scores ~1.0.
+ *
+ * Why symmetric: an event happening next month is more relevant than an
+ * event from last year. Without this, future events would be penalized
+ * relative to facts extracted "recently" but referring to ancient history.
  */
-function recencyScore(extractedAt: number): number {
-  const ageDays = Math.max(0, (Date.now() / 1000 - extractedAt) / 86400);
-  return Math.exp(-(Math.LN2 * ageDays) / RECENCY_HALFLIFE_DAYS);
+function recencyScore(extractedAt: number, eventTs: number | null): number {
+  const anchorTs = eventTs ?? extractedAt;
+  const distanceDays = Math.abs(Date.now() / 1000 - anchorTs) / 86400;
+  return Math.exp(-(Math.LN2 * distanceDays) / RECENCY_HALFLIFE_DAYS);
 }
 
 /**
@@ -130,7 +136,7 @@ export function scoreCandidates(
 
   const scored: ScoredFact[] = candidates.map((c) => {
     const similarity = similarityFromDistance(c.distance);
-    const recency = recencyScore(c.extracted_at);
+    const recency = recencyScore(c.extracted_at, c.event_ts);
     const confidence = c.confidence;
     const entity_match = ctx.matchedSubjectIds.has(c.subject_wa_id) ? 1 : 0;
     const importance = importanceScore(countFactSources(db, c.id));

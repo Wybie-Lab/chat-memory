@@ -101,6 +101,16 @@ Rules:
 - Each fact should be self-contained (readable without the original burst).
 - Return an empty list if the burst contains no durable, grounded facts.
 
+- TIME ANCHOR (event_ts) — for category 'event' or 'commitment' ONLY. If the burst contains an unambiguous specific calendar date for when the event takes place / the commitment is due, return event_ts as Unix seconds (UTC midnight is fine if only the date is known; pick the message-time hour if a specific clock time was given). The burst date is provided to you — use it to anchor relative phrases like "tomorrow", "next Tuesday", "this Sunday" only when the day is unambiguously determinable.
+  Return event_ts ONLY when:
+    - the date is fully specified (year + month + day), OR
+    - a relative phrase resolves to a specific day given the burst date (e.g. "tomorrow" → burst_date + 1d; "next Tuesday" → the upcoming Tuesday).
+  OMIT event_ts (return null or leave the field out) when:
+    - the date is partial ("in the summer", "later this year", "next month"),
+    - the date is ambiguous ("when she gets back", "after the project"),
+    - the event has no date at all (durable facts about a person's life).
+  Wrong dates are worse than missing dates. Be conservative.
+
 Return your output strictly as JSON matching the provided schema.`;
 
 const FILTER_SCHEMA_JSON = {
@@ -132,6 +142,9 @@ const EXTRACT_SCHEMA_JSON = {
           category: { type: 'string', enum: [...FACT_CATEGORIES] },
           content: { type: 'string' },
           confidence: { type: 'number' },
+          // Optional. Unix seconds. Set ONLY for unambiguous event/commitment
+          // dates. Omit (or null) otherwise.
+          event_ts: { type: ['number', 'null'] },
         },
         required: ['subject', 'category', 'content', 'confidence'],
         additionalProperties: false,
@@ -149,6 +162,7 @@ const ExtractZod = z.object({
       category: z.enum(FACT_CATEGORIES),
       content: z.string(),
       confidence: z.number().min(0).max(1),
+      event_ts: z.number().int().nullable().optional(),
     })
   ),
 });

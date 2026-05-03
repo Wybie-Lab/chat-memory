@@ -25,6 +25,14 @@ export interface ExtractedFact {
   category: FactCategory;
   content: string;
   confidence: number;
+  /**
+   * Unix seconds. Set ONLY for event/commitment when the burst contains an
+   * unambiguous specific date for the event itself. Null/undefined for
+   * non-events, or when the date is ambiguous, partial, or unclear.
+   * The extractor must be conservative: a missing event_ts is much better
+   * than a wrong one.
+   */
+  event_ts?: number | null;
 }
 
 export interface UsageMetadata {

@@ -335,6 +335,7 @@ async function processOne(
           category: o.fact.category,
           content: o.fact.content,
           confidence: o.fact.confidence,
+          event_ts: o.fact.event_ts ?? null,
         });
         insertEmbedding(db, factId, e.vector);
         logProcessing(db, {
@@ -356,6 +357,7 @@ async function processOne(
           category: o.fact.category,
           content: o.fact.content,
           confidence: o.fact.confidence,
+          event_ts: o.fact.event_ts ?? null,
         });
         insertEmbedding(db, newId, e.vector);
         markFactSuperseded(db, o.oldId, newId);
@@ -525,6 +527,11 @@ function resolveOp(
         category: op.category,
         content: op.content,
         confidence: op.confidence,
+        // Consolidate doesn't see/return event_ts — pull from the original
+        // candidate. The consolidate prompt copies content/category/confidence
+        // verbatim, so the candidate's event_ts is the right anchor for the
+        // resulting fact.
+        event_ts: candidates[op.candidate_index]?.event_ts ?? null,
       },
     };
   }
@@ -543,6 +550,7 @@ function resolveOp(
         category: op.category,
         content: op.content,
         confidence: op.confidence,
+        event_ts: candidates[op.candidate_index]?.event_ts ?? null,
       },
     };
   }

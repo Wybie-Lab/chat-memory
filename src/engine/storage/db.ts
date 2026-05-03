@@ -25,6 +25,8 @@ export interface FactInput {
   category: string;
   content: string;
   confidence: number;
+  /** Unix seconds. Set for event/commitment when burst pinned an unambiguous date. Null otherwise. */
+  event_ts?: number | null;
 }
 
 export interface ProcessingLogInput {
@@ -111,6 +113,9 @@ function migrate(db: DB): void {
   if (!hasColumn(db, 'contacts', 'live_cutoff_ts')) {
     db.exec('ALTER TABLE contacts ADD COLUMN live_cutoff_ts INTEGER');
   }
+  if (!hasColumn(db, 'facts', 'event_ts')) {
+    db.exec('ALTER TABLE facts ADD COLUMN event_ts INTEGER');
+  }
 
   db.exec('CREATE INDEX IF NOT EXISTS idx_raw_burst ON raw_messages(burst_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_raw_unburst ON raw_messages(contact_id, ts) WHERE burst_id IS NULL');
@@ -118,6 +123,7 @@ function migrate(db: DB): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_active
            ON facts(subject_wa_id)
            WHERE superseded_by_id IS NULL AND deleted_at IS NULL`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_facts_event_ts ON facts(event_ts) WHERE event_ts IS NOT NULL');
 
   backfillFactSources(db);
 }
@@ -423,8 +429,8 @@ export function insertFact(db: DB, fact: FactInput): number {
   const result = db
     .prepare(
       `INSERT INTO facts
-         (source_msg_id, source_burst_id, subject_wa_id, category, content, confidence, extracted_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+         (source_msg_id, source_burst_id, subject_wa_id, category, content, confidence, extracted_at, event_ts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       fact.source_msg_id ?? null,
@@ -433,7 +439,8 @@ export function insertFact(db: DB, fact: FactInput): number {
       fact.category,
       fact.content,
       fact.confidence,
-      now
+      now,
+      fact.event_ts ?? null
     );
   const factId = Number(result.lastInsertRowid);
 
@@ -508,6 +515,7 @@ export interface ActiveFactRow {
   content: string;
   confidence: number;
   extracted_at: number;
+  event_ts: number | null;
 }
 
 /**
@@ -522,7 +530,7 @@ export function activeFactsForCluster(
 ): ActiveFactRow[] {
   return db
     .prepare(
-      `SELECT id, subject_wa_id, category, content, confidence, extracted_at
+      `SELECT id, subject_wa_id, category, content, confidence, extracted_at, event_ts
        FROM facts
        WHERE subject_wa_id = ?
          AND category = ?
@@ -546,7 +554,7 @@ export function existingFactsForSubject(
 ): ActiveFactRow[] {
   return db
     .prepare(
-      `SELECT id, subject_wa_id, category, content, confidence, extracted_at
+      `SELECT id, subject_wa_id, category, content, confidence, extracted_at, event_ts
        FROM facts
        WHERE subject_wa_id = ?
          AND superseded_by_id IS NULL
@@ -582,6 +590,7 @@ export interface FactRow {
   content: string;
   confidence: number;
   extracted_at: number;
+  event_ts: number | null;
   source_msg_id: number | null;
   source_burst_id: number | null;
   source_body: string | null;
@@ -623,7 +632,7 @@ export function listFacts(
   const whereClause = `WHERE ${where.join(' AND ')}`;
   const sql = `
     SELECT
-      f.id, f.subject_wa_id, f.category, f.content, f.confidence, f.extracted_at,
+      f.id, f.subject_wa_id, f.category, f.content, f.confidence, f.extracted_at, f.event_ts,
       f.source_msg_id, f.source_burst_id,
       COALESCE(rm.body, fbm.body)             AS source_body,
       COALESCE(rm.ts,   b.start_ts)           AS source_ts,
@@ -655,7 +664,7 @@ export function searchFactsByVector(
       `SELECT
          fe.fact_id AS id,
          fe.distance AS distance,
-         f.subject_wa_id, f.category, f.content, f.confidence, f.extracted_at,
+         f.subject_wa_id, f.category, f.content, f.confidence, f.extracted_at, f.event_ts,
          f.source_msg_id, f.source_burst_id,
          COALESCE(rm.body, fbm.body)             AS source_body,
          COALESCE(rm.ts,   b.start_ts)           AS source_ts,
@@ -700,7 +709,7 @@ export function searchFactsForSubjectByVector(
     .prepare(
       `SELECT
          fe.fact_id AS id,
-         f.subject_wa_id, f.category, f.content, f.confidence, f.extracted_at
+         f.subject_wa_id, f.category, f.content, f.confidence, f.extracted_at, f.event_ts
        FROM fact_embeddings fe
        JOIN facts f ON f.id = fe.fact_id
        WHERE fe.embedding MATCH ?
@@ -917,7 +926,7 @@ export function activePreferences(db: DB, subjectWaId?: string): ActiveFactRow[]
   }
   return db
     .prepare(
-      `SELECT id, subject_wa_id, category, content, confidence, extracted_at
+      `SELECT id, subject_wa_id, category, content, confidence, extracted_at, event_ts
        FROM facts
        WHERE ${where.join(' AND ')}
        ORDER BY confidence DESC, extracted_at DESC`
@@ -926,23 +935,35 @@ export function activePreferences(db: DB, subjectWaId?: string): ActiveFactRow[]
 }
 
 /**
- * Recent episode-shaped facts (event + commitment categories), within the
- * trailing window of `days`. Episodes whose value is the temporal anchor —
- * "she's flying to Tokyo next week", "promised to send photos by Friday".
+ * Recent + upcoming episode-shaped facts (event + commitment categories).
+ * The temporal window applies to event_ts when set (so future events with no
+ * event_ts fall back to extracted_at); the past-side window is `days` days.
+ *
+ * Returned ordering: future events first, soonest at the top, then past events
+ * most-recent-first. This shape lets retrieval split into <upcoming_events>
+ * and <recent_past> sections without re-sorting in JS.
  */
 export function recentEpisodes(db: DB, days: number): ActiveFactRow[] {
-  const cutoff = Math.floor(Date.now() / 1000) - days * 86400;
+  const now = Math.floor(Date.now() / 1000);
+  const pastCutoff = now - days * 86400;
   return db
     .prepare(
-      `SELECT id, subject_wa_id, category, content, confidence, extracted_at
+      `SELECT id, subject_wa_id, category, content, confidence, extracted_at, event_ts
        FROM facts
        WHERE superseded_by_id IS NULL
          AND deleted_at IS NULL
          AND category IN ('event', 'commitment')
-         AND extracted_at >= ?
-       ORDER BY extracted_at DESC`
+         AND COALESCE(event_ts, extracted_at) >= ?
+       ORDER BY
+         -- 0 = future, 1 = past so future bubbles up.
+         CASE WHEN COALESCE(event_ts, extracted_at) >= ? THEN 0 ELSE 1 END,
+         -- Within future, soonest first; within past, most-recent first.
+         CASE WHEN COALESCE(event_ts, extracted_at) >= ?
+              THEN COALESCE(event_ts, extracted_at)
+              ELSE -COALESCE(event_ts, extracted_at)
+         END`
     )
-    .all(cutoff) as ActiveFactRow[];
+    .all(pastCutoff, now, now) as ActiveFactRow[];
 }
 
 export interface SubjectInfo {
@@ -983,7 +1004,7 @@ export function factsAboutSubject(
 ): ActiveFactRow[] {
   return db
     .prepare(
-      `SELECT id, subject_wa_id, category, content, confidence, extracted_at
+      `SELECT id, subject_wa_id, category, content, confidence, extracted_at, event_ts
        FROM facts
        WHERE subject_wa_id = ?
          AND superseded_by_id IS NULL
