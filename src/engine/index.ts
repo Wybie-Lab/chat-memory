@@ -68,6 +68,7 @@ export {
   logProcessing,
   listUnprocessedBursts,
   getBurstMessages,
+  getBurstQueueStats,
   markBurstFiltered,
   markBurstProcessed,
 } from './storage/db';
@@ -87,6 +88,7 @@ export type {
   UnprocessedBurst,
   BurstMessage,
   BurstRow,
+  BurstQueueStats,
   ProcessingLogInput,
 } from './storage/db';
 

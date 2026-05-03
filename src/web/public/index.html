@@ -42,6 +42,25 @@
     nav button:hover { color: var(--fg); }
     nav button.active { background: var(--panel-2); color: var(--fg); border-color: var(--border); }
 
+    #pipeline-status {
+      margin-left: auto; display: none; flex-direction: column; gap: 4px;
+      min-width: 180px; max-width: 280px; align-items: stretch;
+    }
+    #pipeline-status.visible { display: flex; }
+    #pipeline-status .ps-label {
+      display: flex; justify-content: space-between; gap: 8px;
+      font-size: 11px; color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+    #pipeline-status .ps-label strong { color: var(--fg); font-weight: 500; }
+    #pipeline-status .ps-bar {
+      height: 4px; background: var(--panel-2); border-radius: 2px; overflow: hidden;
+    }
+    #pipeline-status .ps-bar > span {
+      display: block; height: 100%; width: 0%;
+      background: var(--accent); transition: width 0.4s ease-out;
+    }
+
     main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
     .view { display: none; flex: 1; flex-direction: column; min-height: 0; }
     .view.active { display: flex; }
@@ -272,6 +291,13 @@
       <button data-view="facts">Facts</button>
       <button data-view="import">Import</button>
     </nav>
+    <div id="pipeline-status" aria-live="polite">
+      <div class="ps-label">
+        <span>Processing bursts</span>
+        <span><strong class="ps-done">0</strong> / <span class="ps-total">0</span> · <span class="ps-pct">0%</span></span>
+      </div>
+      <div class="ps-bar"><span class="ps-fill"></span></div>
+    </div>
   </header>
 
   <main>
@@ -791,6 +817,54 @@
         importSubmit.disabled = false;
       }
     });
+
+    // ---- pipeline progress ----
+    const psEl = $('#pipeline-status');
+    const psDone = psEl.querySelector('.ps-done');
+    const psTotal = psEl.querySelector('.ps-total');
+    const psPct = psEl.querySelector('.ps-pct');
+    const psFill = psEl.querySelector('.ps-fill');
+
+    // Poll while there's pending work; once done, do a final render and stop
+    // until the user reloads. A new import that creates fresh bursts naturally
+    // means a reload, so this doesn't need to handle re-arming on its own.
+    let psPollTimer = null;
+    let psStopped = false;
+
+    async function loadPipelineStatus() {
+      try {
+        const r = await fetch('/api/pipeline-status');
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'request failed');
+        const { total, processed } = data;
+        const pending = total - processed;
+
+        if (total === 0) {
+          psEl.classList.remove('visible');
+          return;
+        }
+        psEl.classList.add('visible');
+
+        const pct = total === 0 ? 0 : Math.round((processed / total) * 100);
+        psDone.textContent = processed;
+        psTotal.textContent = total;
+        psPct.textContent = pct + '%';
+        psFill.style.width = pct + '%';
+
+        if (pending === 0 && !psStopped) {
+          // One-shot fade once we hit 100%, then stop polling.
+          psStopped = true;
+          clearInterval(psPollTimer);
+          setTimeout(() => psEl.classList.remove('visible'), 4000);
+        }
+      } catch (err) {
+        // Silent — status panel just won't update. Don't spam the user with
+        // errors for a non-essential UI affordance.
+      }
+    }
+
+    loadPipelineStatus();
+    psPollTimer = setInterval(loadPipelineStatus, 3000);
 
     // initial focus
     input.focus();
