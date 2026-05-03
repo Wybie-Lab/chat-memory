@@ -970,12 +970,14 @@ export interface SubjectInfo {
   subject_wa_id: string;
   display_name: string | null;
   active_fact_count: number;
+  /** Most-recent extracted_at across active facts; null if no active facts. */
+  last_updated_ts: number | null;
 }
 
 /**
  * All subjects that have at least one active fact, with their contact display
- * name (if a matching contact exists). Used for entity matching: detect when
- * the user's question mentions one of these names.
+ * name (if a matching contact exists). Used for entity matching, the
+ * subject-list sidebar, and any "what people do we know about" report.
  */
 export function allActiveSubjects(db: DB): SubjectInfo[] {
   return db
@@ -983,7 +985,8 @@ export function allActiveSubjects(db: DB): SubjectInfo[] {
       `SELECT
          f.subject_wa_id                   AS subject_wa_id,
          c.display_name                    AS display_name,
-         COUNT(*)                          AS active_fact_count
+         COUNT(*)                          AS active_fact_count,
+         MAX(f.extracted_at)               AS last_updated_ts
        FROM facts f
        LEFT JOIN contacts c ON c.wa_id = f.subject_wa_id
        WHERE f.superseded_by_id IS NULL AND f.deleted_at IS NULL
@@ -991,6 +994,99 @@ export function allActiveSubjects(db: DB): SubjectInfo[] {
        ORDER BY active_fact_count DESC`
     )
     .all() as SubjectInfo[];
+}
+
+/** Single subject lookup with the same shape as allActiveSubjects entries. */
+export function getSubjectInfo(db: DB, subjectWaId: string): SubjectInfo | null {
+  const row = db
+    .prepare(
+      `SELECT
+         f.subject_wa_id                   AS subject_wa_id,
+         c.display_name                    AS display_name,
+         COUNT(*)                          AS active_fact_count,
+         MAX(f.extracted_at)               AS last_updated_ts
+       FROM facts f
+       LEFT JOIN contacts c ON c.wa_id = f.subject_wa_id
+       WHERE f.subject_wa_id = ?
+         AND f.superseded_by_id IS NULL
+         AND f.deleted_at IS NULL
+       GROUP BY f.subject_wa_id, c.display_name`
+    )
+    .get(subjectWaId) as SubjectInfo | undefined;
+  return row && row.active_fact_count > 0 ? row : null;
+}
+
+export interface SupersededFactRow {
+  id: number;
+  subject_wa_id: string;
+  category: string;
+  content: string;
+  confidence: number;
+  extracted_at: number;
+  event_ts: number | null;
+  superseded_by_id: number | null;
+  deleted_at: number | null;
+  /** When superseded, the replacement fact's content (null when soft-deleted). */
+  replacement_content: string | null;
+  replacement_id: number | null;
+}
+
+/**
+ * Historical facts for a subject — the "previously believed" trail. Includes
+ * both superseded facts (have a replacement) and soft-deleted facts (no
+ * replacement). Most recent first so the UI shows the most recent change at
+ * the top.
+ */
+export function supersededFactsForSubject(
+  db: DB,
+  subjectWaId: string,
+  limit = 200
+): SupersededFactRow[] {
+  return db
+    .prepare(
+      `SELECT
+         f.id, f.subject_wa_id, f.category, f.content, f.confidence, f.extracted_at, f.event_ts,
+         f.superseded_by_id, f.deleted_at,
+         repl.content AS replacement_content,
+         repl.id      AS replacement_id
+       FROM facts f
+       LEFT JOIN facts repl ON repl.id = f.superseded_by_id
+       WHERE f.subject_wa_id = ?
+         AND (f.superseded_by_id IS NOT NULL OR f.deleted_at IS NOT NULL)
+       ORDER BY f.extracted_at DESC
+       LIMIT ?`
+    )
+    .all(subjectWaId, limit) as SupersededFactRow[];
+}
+
+/**
+ * Active facts for a subject WITH the same source-detail JOIN as listFacts —
+ * used by the subject detail endpoint so the UI can render source bodies and
+ * timestamps next to each fact, the same way the global Facts view does.
+ */
+export function factsAboutSubjectWithSource(db: DB, subjectWaId: string): FactRow[] {
+  return db
+    .prepare(
+      `SELECT
+         f.id, f.subject_wa_id, f.category, f.content, f.confidence, f.extracted_at, f.event_ts,
+         f.source_msg_id, f.source_burst_id,
+         COALESCE(rm.body, fbm.body)             AS source_body,
+         COALESCE(rm.ts,   b.start_ts)           AS source_ts,
+         COALESCE(rm.direction, fbm.direction)   AS source_direction
+       FROM facts f
+       LEFT JOIN raw_messages rm ON rm.id = f.source_msg_id
+       LEFT JOIN conversation_bursts b ON b.id = f.source_burst_id
+       LEFT JOIN raw_messages fbm ON fbm.id = (
+         SELECT id FROM raw_messages
+         WHERE burst_id = f.source_burst_id AND body != ''
+         ORDER BY ts ASC, id ASC LIMIT 1
+       )
+       WHERE f.subject_wa_id = ?
+         AND f.superseded_by_id IS NULL
+         AND f.deleted_at IS NULL
+       ORDER BY f.category, f.confidence DESC, f.extracted_at DESC`
+    )
+    .all(subjectWaId) as FactRow[];
 }
 
 /**
