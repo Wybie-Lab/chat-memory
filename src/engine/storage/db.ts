@@ -371,6 +371,23 @@ export function listUnprocessedBursts(
   return rows.map((r) => ({ ...r, is_group: r.is_group === 1 }));
 }
 
+export interface BurstQueueStats {
+  total: number;
+  processed: number;
+}
+
+export function getBurstQueueStats(db: DB): BurstQueueStats {
+  const row = db
+    .prepare(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN processed_at IS NOT NULL THEN 1 ELSE 0 END) AS processed
+       FROM conversation_bursts`
+    )
+    .get() as { total: number; processed: number | null };
+  return { total: row.total, processed: row.processed ?? 0 };
+}
+
 export function getBurstMessages(db: DB, burstId: number): BurstMessage[] {
   return db
     .prepare(

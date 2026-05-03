@@ -8,3 +8,4 @@ config/whitelist.json
 *.log
 .DS_Store
 .context/
+.claude/

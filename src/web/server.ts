@@ -6,6 +6,7 @@ import {
   listFacts,
   listCategories,
   composeMemoryBlock,
+  getBurstQueueStats,
 } from '../engine';
 import { createLLMProvider } from '../llm/claude';
 import {
@@ -77,6 +78,15 @@ app.post('/api/chat', async (req: Request, res: Response) => {
       budget: composed.budget,
       usage,
     });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/pipeline-status', (_req: Request, res: Response) => {
+  try {
+    const stats = getBurstQueueStats(db);
+    res.json(stats);
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
