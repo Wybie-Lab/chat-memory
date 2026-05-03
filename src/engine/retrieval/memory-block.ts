@@ -6,8 +6,8 @@ import {
   type ActiveFactRow,
   type ClusterSummaryRow,
   type DB,
-} from '../memory/db';
-import type { LLMProvider, UsageMetadata } from '../llm/provider';
+} from '../storage/db';
+import type { LLMProvider, UsageMetadata } from '../../llm/provider';
 import {
   buildRetrievalContext,
   hybridRetrieve,

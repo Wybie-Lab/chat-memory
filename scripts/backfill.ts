@@ -1,12 +1,12 @@
 import 'dotenv/config';
-import { createWAClient } from '../src/whatsapp/client';
+import { createWAClient } from '../src/sources/whatsapp/client';
 import {
   openDb,
   upsertContact,
   insertRawMessage,
   rebuildAllBursts,
-} from '../src/memory/db';
-import { loadWhitelist, syncWhitelistToDb } from '../src/config/whitelist';
+} from '../src/engine';
+import { loadWhitelist, syncWhitelistToDb } from '../src/sources/whatsapp/whitelist';
 
 async function main() {
   const sessionPath = process.env.SESSION_PATH ?? './data/session';

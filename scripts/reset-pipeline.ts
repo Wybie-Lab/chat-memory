@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { openDb, rebuildAllBursts } from '../src/memory/db';
+import { openDb, rebuildAllBursts } from '../src/engine';
 
 async function main() {
   const dbPath = process.env.DB_PATH ?? './data/memory.db';
