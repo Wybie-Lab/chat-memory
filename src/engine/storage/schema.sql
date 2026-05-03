@@ -56,6 +56,11 @@ CREATE TABLE IF NOT EXISTS facts (
   content           TEXT NOT NULL,
   confidence        REAL NOT NULL DEFAULT 1.0,
   extracted_at      INTEGER NOT NULL,
+  -- Unix seconds when an event/commitment is anchored. Null for non-event
+  -- categories or when the burst didn't determine an unambiguous date.
+  -- Retrieval surfaces this separately so future plans can rank above stale
+  -- history.
+  event_ts          INTEGER,
   superseded_by_id  INTEGER REFERENCES facts(id),
   deleted_at        INTEGER
 );

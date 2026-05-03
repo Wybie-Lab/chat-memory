@@ -192,8 +192,15 @@ function formatCluster(c: ClusterSummaryRow): string {
 }
 
 function formatEpisode(e: ActiveFactRow): string {
-  const date = new Date(e.extracted_at * 1000).toISOString().slice(0, 10);
-  return `- ${date} (${e.subject_wa_id}, ${e.category}): ${e.content} [fact:${e.id}]`;
+  // Anchor on event_ts when set (the actual event date) — otherwise on
+  // extracted_at (when we learned about it). The "→" marker flags upcoming
+  // items so the chat agent can answer "what's planned" vs "what happened"
+  // without parsing dates from prose.
+  const anchorTs = e.event_ts ?? e.extracted_at;
+  const date = new Date(anchorTs * 1000).toISOString().slice(0, 10);
+  const isFuture = e.event_ts !== null && e.event_ts > Date.now() / 1000;
+  const marker = isFuture ? '→ ' : '';
+  return `- ${marker}${date} (${e.subject_wa_id}, ${e.category}): ${e.content} [fact:${e.id}]`;
 }
 
 interface SectionLines {
