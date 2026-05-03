@@ -5,7 +5,7 @@ import {
   type DB,
   type FactSearchResult,
   type SubjectInfo,
-} from '../memory/db';
+} from '../storage/db';
 
 export interface ScoreWeights {
   semantic: number;

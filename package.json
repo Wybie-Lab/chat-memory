@@ -4,8 +4,8 @@
   "private": true,
   "description": "Personal WhatsApp memory layer — reads messages, extracts important info, stores in queryable memory",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/cli/live.ts",
+    "start": "tsx src/cli/live.ts",
     "backfill": "tsx scripts/backfill.ts",
     "import-chat": "tsx scripts/import-chat.ts",
     "process": "tsx scripts/process.ts",

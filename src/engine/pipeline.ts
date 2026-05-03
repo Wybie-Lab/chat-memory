@@ -17,7 +17,7 @@ import {
   type DB,
   type UnprocessedBurst,
   type ActiveFactRow,
-} from '../memory/db';
+} from './storage/db';
 import type {
   LLMProvider,
   BurstInput,
@@ -25,7 +25,7 @@ import type {
   ConsolidationOp,
   ExtractedFact,
 } from '../llm/provider';
-import { guardFacts } from './extract-guard';
+import { guardFacts } from './guard';
 
 export interface ProcessOptions {
   batchSize?: number;

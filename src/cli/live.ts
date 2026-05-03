@@ -1,15 +1,15 @@
 import 'dotenv/config';
-import { createWAClient } from './whatsapp/client';
+import { createWAClient } from '../sources/whatsapp/client';
 import {
   openDb,
   upsertContact,
   insertRawMessage,
   assignMessageToBurst,
   getLiveCutoff,
-} from './memory/db';
-import { loadWhitelist, syncWhitelistToDb } from './config/whitelist';
-import { createLLMProvider } from './llm/claude';
-import { processBatch } from './pipeline/process';
+  processBatch,
+} from '../engine';
+import { loadWhitelist, syncWhitelistToDb } from '../sources/whatsapp/whitelist';
+import { createLLMProvider } from '../llm/claude';
 
 async function main() {
   const sessionPath = process.env.SESSION_PATH ?? './data/session';

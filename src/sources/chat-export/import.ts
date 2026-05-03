@@ -5,8 +5,8 @@ import {
   rebuildAllBursts,
   setLiveCutoff,
   type DB,
-} from '../memory/db';
-import { parseExport, type ParseStats } from './parse-export';
+} from '../../engine';
+import { parseExport, type ParseStats } from './parse';
 
 export interface ImportChatArgs {
   /** Raw text content of the WhatsApp _chat.txt export. */

@@ -1,9 +1,9 @@
 import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
-import { openDb } from '../src/memory/db';
-import { loadWhitelist, syncWhitelistToDb } from '../src/config/whitelist';
-import { importChat } from '../src/whatsapp/import-chat';
+import { openDb } from '../src/engine';
+import { loadWhitelist, syncWhitelistToDb } from '../src/sources/whatsapp/whitelist';
+import { importChat } from '../src/sources/chat-export/import';
 
 interface Args {
   file: string;

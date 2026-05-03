@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import type { DB } from '../memory/db';
+import type { DB } from '../../engine';
 
 export interface WhitelistEntry {
   wa_id: string;

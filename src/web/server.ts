@@ -5,17 +5,17 @@ import {
   openDb,
   listFacts,
   listCategories,
-} from '../memory/db';
+  composeMemoryBlock,
+} from '../engine';
 import { createLLMProvider } from '../llm/claude';
 import {
   loadWhitelist,
   syncWhitelistToDb,
   addContactToWhitelistFile,
-} from '../config/whitelist';
-import { importChat } from '../whatsapp/import-chat';
-import { phoneToWaId } from '../whatsapp/phone';
-import { detectOtherSender } from '../whatsapp/parse-export';
-import { composeMemoryBlock } from '../retrieval/memory-block';
+} from '../sources/whatsapp/whitelist';
+import { importChat } from '../sources/chat-export/import';
+import { phoneToWaId } from '../sources/whatsapp/phone';
+import { detectOtherSender } from '../sources/chat-export/parse';
 
 const dbPath = process.env.DB_PATH ?? './data/memory.db';
 const whitelistPath = process.env.WHITELIST_PATH ?? './config/whitelist.json';
