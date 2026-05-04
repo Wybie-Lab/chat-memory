@@ -1215,6 +1215,7 @@ export interface KnowledgeEdgeRow {
   event_ts: number | null;
   valid_from_ts: number | null;
   valid_to_ts: number | null;
+  first_seen_ts: number | null;
   status: string;
   superseded_by_edge_id: number | null;
   deleted_at: number | null;
@@ -1229,6 +1230,13 @@ export interface GraphBuildStats {
   entities: number;
   mentions: number;
   edges: number;
+}
+
+export interface GraphTimeline {
+  min_ts: number | null;
+  max_ts: number | null;
+  steps: number[];
+  total_steps: number;
 }
 
 export function clearGraphTables(db: DB): void {
@@ -1398,7 +1406,25 @@ export function deactivateGraphForFact(db: DB, factId: number, status: 'deleted'
   ).run(status, now, factId);
 }
 
-export function graphCounts(db: DB): GraphBuildStats {
+export function graphCounts(db: DB, atTs?: number | null): GraphBuildStats {
+  if (atTs !== null && atTs !== undefined) {
+    const row = db
+      .prepare(
+        `${graphTimeCtes()}
+         SELECT
+           (SELECT COUNT(DISTINCT entity_id) FROM (
+              SELECT source_entity_id AS entity_id FROM visible_edges
+              UNION
+              SELECT target_entity_id AS entity_id FROM visible_edges
+              UNION
+              SELECT entity_id FROM visible_mentions
+            )) AS entities,
+           (SELECT COUNT(*) FROM visible_mentions) AS mentions,
+           (SELECT COUNT(*) FROM visible_edges) AS edges`
+      )
+      .get(atTs, atTs) as GraphBuildStats;
+    return row;
+  }
   const entities = db.prepare('SELECT COUNT(*) AS n FROM entities').get() as { n: number };
   const mentions = db
     .prepare('SELECT COUNT(*) AS n FROM fact_entity_mentions')
@@ -1492,6 +1518,56 @@ function rowToKnowledgeEdge(r: Omit<KnowledgeEdgeRow, 'qualifiers'> & { qualifie
   };
 }
 
+function graphTimeCtes(): string {
+  return `
+    WITH edge_times AS (
+      SELECT
+        e.id AS edge_id,
+        e.source_entity_id,
+        e.target_entity_id,
+        MIN(COALESCE(
+          b.end_ts,
+          rm.ts,
+          f.event_ts,
+          es.attached_at,
+          e.extracted_at
+        )) AS first_seen_ts
+      FROM knowledge_edges e
+      LEFT JOIN edge_sources es ON es.edge_id = e.id
+      LEFT JOIN facts f ON f.id = COALESCE(es.fact_id, e.source_fact_id)
+      LEFT JOIN conversation_bursts b ON b.id = COALESCE(es.burst_id, f.source_burst_id, e.source_burst_id)
+      LEFT JOIN raw_messages rm ON rm.id = f.source_msg_id
+      WHERE e.status = 'active'
+        AND e.deleted_at IS NULL
+      GROUP BY e.id
+    ),
+    visible_edges AS (
+      SELECT * FROM edge_times WHERE first_seen_ts <= ?
+    ),
+    mention_times AS (
+      SELECT
+        m.id AS mention_id,
+        m.entity_id,
+        MIN(COALESCE(
+          b.end_ts,
+          rm.ts,
+          f.event_ts,
+          m.created_at,
+          f.extracted_at
+        )) AS first_seen_ts
+      FROM fact_entity_mentions m
+      JOIN facts f ON f.id = m.fact_id
+      LEFT JOIN conversation_bursts b ON b.id = f.source_burst_id
+      LEFT JOIN raw_messages rm ON rm.id = f.source_msg_id
+      WHERE f.superseded_by_id IS NULL
+        AND f.deleted_at IS NULL
+      GROUP BY m.id
+    ),
+    visible_mentions AS (
+      SELECT * FROM mention_times WHERE first_seen_ts <= ?
+    )`;
+}
+
 export function graphNeighborhood(
   db: DB,
   entityId: number,
@@ -1516,6 +1592,13 @@ export function graphNeighborhood(
          e.event_ts,
          e.valid_from_ts,
          e.valid_to_ts,
+         MIN(COALESCE(
+           b.end_ts,
+           rm.ts,
+           f.event_ts,
+           es.attached_at,
+           e.extracted_at
+         )) AS first_seen_ts,
          e.status,
          e.superseded_by_edge_id,
          e.deleted_at,
@@ -1523,9 +1606,14 @@ export function graphNeighborhood(
        FROM knowledge_edges e
        JOIN entities s ON s.id = e.source_entity_id
        JOIN entities t ON t.id = e.target_entity_id
+       LEFT JOIN edge_sources es ON es.edge_id = e.id
+       LEFT JOIN facts f ON f.id = COALESCE(es.fact_id, e.source_fact_id)
+       LEFT JOIN conversation_bursts b ON b.id = COALESCE(es.burst_id, f.source_burst_id, e.source_burst_id)
+       LEFT JOIN raw_messages rm ON rm.id = f.source_msg_id
        WHERE (e.source_entity_id = ? OR e.target_entity_id = ?)
          AND e.status = 'active'
          AND e.deleted_at IS NULL
+       GROUP BY e.id
        ORDER BY e.confidence DESC, e.id DESC
        LIMIT ?`
     )
@@ -1536,25 +1624,108 @@ export function graphNeighborhood(
 export interface GraphEntityWithStatsRow extends GraphEntityRow {
   outgoing_edge_count: number;
   incoming_edge_count: number;
+  first_seen_ts: number | null;
 }
 
-export function listGraphEntitiesWithStats(db: DB, limit = 500): GraphEntityWithStatsRow[] {
+export function listGraphEntitiesWithStats(
+  db: DB,
+  limit = 500,
+  atTs?: number | null
+): GraphEntityWithStatsRow[] {
+  if (atTs !== null && atTs !== undefined) {
+    const rows = db
+      .prepare(
+        `${graphTimeCtes()}
+         SELECT
+           e.id, e.entity_type, e.canonical_key, e.display_name, e.aliases_json,
+           e.confidence, e.created_at, e.updated_at, e.merged_into_id,
+           COUNT(DISTINCT out_e.edge_id) AS outgoing_edge_count,
+           COUNT(DISTINCT in_e.edge_id) AS incoming_edge_count,
+           MIN(COALESCE(out_e.first_seen_ts, in_e.first_seen_ts, vm.first_seen_ts, e.created_at)) AS first_seen_ts
+         FROM entities e
+         LEFT JOIN visible_edges out_e ON out_e.source_entity_id = e.id
+         LEFT JOIN visible_edges in_e ON in_e.target_entity_id = e.id
+         LEFT JOIN visible_mentions vm ON vm.entity_id = e.id
+         WHERE e.merged_into_id IS NULL
+           AND (out_e.edge_id IS NOT NULL OR in_e.edge_id IS NOT NULL OR vm.mention_id IS NOT NULL)
+         GROUP BY e.id
+         ORDER BY (COUNT(DISTINCT out_e.edge_id) + COUNT(DISTINCT in_e.edge_id)) DESC,
+                  e.confidence DESC,
+                  e.display_name ASC
+         LIMIT ?`
+      )
+      .all(atTs, atTs, limit) as Array<Parameters<typeof rowToGraphEntity>[0] & {
+      outgoing_edge_count: number;
+      incoming_edge_count: number;
+      first_seen_ts: number | null;
+    }>;
+    return rows.map((r) => ({
+      ...rowToGraphEntity(r),
+      outgoing_edge_count: r.outgoing_edge_count,
+      incoming_edge_count: r.incoming_edge_count,
+      first_seen_ts: r.first_seen_ts,
+    }));
+  }
+
   const rows = db
     .prepare(
-      `SELECT
+      `WITH edge_times AS (
+         SELECT
+           e.id AS edge_id,
+           e.source_entity_id,
+           e.target_entity_id,
+           MIN(COALESCE(
+             b.end_ts,
+             rm.ts,
+             f.event_ts,
+             es.attached_at,
+             e.extracted_at
+           )) AS first_seen_ts
+         FROM knowledge_edges e
+         LEFT JOIN edge_sources es ON es.edge_id = e.id
+         LEFT JOIN facts f ON f.id = COALESCE(es.fact_id, e.source_fact_id)
+         LEFT JOIN conversation_bursts b ON b.id = COALESCE(es.burst_id, f.source_burst_id, e.source_burst_id)
+         LEFT JOIN raw_messages rm ON rm.id = f.source_msg_id
+         WHERE e.status = 'active'
+           AND e.deleted_at IS NULL
+         GROUP BY e.id
+       ),
+       mention_times AS (
+         SELECT
+           m.entity_id,
+           MIN(COALESCE(
+             b.end_ts,
+             rm.ts,
+             f.event_ts,
+             m.created_at,
+             f.extracted_at
+           )) AS first_seen_ts
+         FROM fact_entity_mentions m
+         JOIN facts f ON f.id = m.fact_id
+         LEFT JOIN conversation_bursts b ON b.id = f.source_burst_id
+         LEFT JOIN raw_messages rm ON rm.id = f.source_msg_id
+         WHERE f.superseded_by_id IS NULL
+           AND f.deleted_at IS NULL
+         GROUP BY m.entity_id
+       )
+       SELECT
          e.id, e.entity_type, e.canonical_key, e.display_name, e.aliases_json,
          e.confidence, e.created_at, e.updated_at, e.merged_into_id,
          COUNT(DISTINCT out_e.id) AS outgoing_edge_count,
-         COUNT(DISTINCT in_e.id) AS incoming_edge_count
+         COUNT(DISTINCT in_e.id) AS incoming_edge_count,
+         MIN(COALESCE(out_et.first_seen_ts, in_et.first_seen_ts, mt.first_seen_ts, e.created_at)) AS first_seen_ts
        FROM entities e
        LEFT JOIN knowledge_edges out_e
          ON out_e.source_entity_id = e.id
         AND out_e.status = 'active'
         AND out_e.deleted_at IS NULL
+       LEFT JOIN edge_times out_et ON out_et.edge_id = out_e.id
        LEFT JOIN knowledge_edges in_e
          ON in_e.target_entity_id = e.id
         AND in_e.status = 'active'
         AND in_e.deleted_at IS NULL
+       LEFT JOIN edge_times in_et ON in_et.edge_id = in_e.id
+       LEFT JOIN mention_times mt ON mt.entity_id = e.id
        WHERE e.merged_into_id IS NULL
        GROUP BY e.id
        ORDER BY (COUNT(DISTINCT out_e.id) + COUNT(DISTINCT in_e.id)) DESC,
@@ -1565,15 +1736,19 @@ export function listGraphEntitiesWithStats(db: DB, limit = 500): GraphEntityWith
     .all(limit) as Array<Parameters<typeof rowToGraphEntity>[0] & {
     outgoing_edge_count: number;
     incoming_edge_count: number;
+    first_seen_ts: number | null;
   }>;
   return rows.map((r) => ({
     ...rowToGraphEntity(r),
     outgoing_edge_count: r.outgoing_edge_count,
     incoming_edge_count: r.incoming_edge_count,
+    first_seen_ts: r.first_seen_ts,
   }));
 }
 
-export function listKnowledgeEdges(db: DB, limit = 1000): KnowledgeEdgeRow[] {
+export function listKnowledgeEdges(db: DB, limit = 1000, atTs?: number | null): KnowledgeEdgeRow[] {
+  const timeFilter = atTs !== null && atTs !== undefined ? 'HAVING first_seen_ts <= ?' : '';
+  const params = atTs !== null && atTs !== undefined ? [atTs, limit] : [limit];
   const rows = db
     .prepare(
       `SELECT
@@ -1592,6 +1767,13 @@ export function listKnowledgeEdges(db: DB, limit = 1000): KnowledgeEdgeRow[] {
          e.event_ts,
          e.valid_from_ts,
          e.valid_to_ts,
+         MIN(COALESCE(
+           b.end_ts,
+           rm.ts,
+           f.event_ts,
+           es.attached_at,
+           e.extracted_at
+         )) AS first_seen_ts,
          e.status,
          e.superseded_by_edge_id,
          e.deleted_at,
@@ -1599,13 +1781,79 @@ export function listKnowledgeEdges(db: DB, limit = 1000): KnowledgeEdgeRow[] {
        FROM knowledge_edges e
        JOIN entities s ON s.id = e.source_entity_id
        JOIN entities t ON t.id = e.target_entity_id
+       LEFT JOIN edge_sources es ON es.edge_id = e.id
+       LEFT JOIN facts f ON f.id = COALESCE(es.fact_id, e.source_fact_id)
+       LEFT JOIN conversation_bursts b ON b.id = COALESCE(es.burst_id, f.source_burst_id, e.source_burst_id)
+       LEFT JOIN raw_messages rm ON rm.id = f.source_msg_id
        WHERE e.status = 'active'
          AND e.deleted_at IS NULL
+       GROUP BY e.id
+       ${timeFilter}
        ORDER BY e.confidence DESC, e.id DESC
        LIMIT ?`
     )
-    .all(limit) as Array<Omit<KnowledgeEdgeRow, 'qualifiers'> & { qualifiers_json: string }>;
+    .all(...params) as Array<Omit<KnowledgeEdgeRow, 'qualifiers'> & { qualifiers_json: string }>;
   return rows.map(rowToKnowledgeEdge);
+}
+
+export function graphTimeline(db: DB, limit = 500): GraphTimeline {
+  const rows = db
+    .prepare(
+      `WITH edge_times AS (
+         SELECT
+           e.id AS row_id,
+           MIN(COALESCE(
+             b.end_ts,
+             rm.ts,
+             f.event_ts,
+             es.attached_at,
+             e.extracted_at
+           )) AS first_seen_ts
+         FROM knowledge_edges e
+         LEFT JOIN edge_sources es ON es.edge_id = e.id
+         LEFT JOIN facts f ON f.id = COALESCE(es.fact_id, e.source_fact_id)
+         LEFT JOIN conversation_bursts b ON b.id = COALESCE(es.burst_id, f.source_burst_id, e.source_burst_id)
+         LEFT JOIN raw_messages rm ON rm.id = f.source_msg_id
+         WHERE e.status = 'active'
+           AND e.deleted_at IS NULL
+         GROUP BY e.id
+       ),
+       mention_times AS (
+         SELECT
+           m.id AS row_id,
+           MIN(COALESCE(
+             b.end_ts,
+             rm.ts,
+             f.event_ts,
+             m.created_at,
+             f.extracted_at
+           )) AS first_seen_ts
+         FROM fact_entity_mentions m
+         JOIN facts f ON f.id = m.fact_id
+         LEFT JOIN conversation_bursts b ON b.id = f.source_burst_id
+         LEFT JOIN raw_messages rm ON rm.id = f.source_msg_id
+         WHERE f.superseded_by_id IS NULL
+           AND f.deleted_at IS NULL
+         GROUP BY m.id
+       ),
+       all_times AS (
+         SELECT first_seen_ts FROM edge_times WHERE first_seen_ts IS NOT NULL
+         UNION
+         SELECT first_seen_ts FROM mention_times WHERE first_seen_ts IS NOT NULL
+       )
+       SELECT first_seen_ts
+       FROM all_times
+       ORDER BY first_seen_ts ASC
+       LIMIT ?`
+    )
+    .all(limit) as Array<{ first_seen_ts: number }>;
+  const steps = rows.map((r) => r.first_seen_ts);
+  return {
+    min_ts: steps[0] ?? null,
+    max_ts: steps[steps.length - 1] ?? null,
+    steps,
+    total_steps: steps.length,
+  };
 }
 
 export function graphForFact(db: DB, factId: number): {
@@ -1660,6 +1908,7 @@ export function graphForFact(db: DB, factId: number): {
          e.event_ts,
          e.valid_from_ts,
          e.valid_to_ts,
+         COALESCE(b.end_ts, rm.ts, f.event_ts, es.attached_at, e.extracted_at) AS first_seen_ts,
          e.status,
          e.superseded_by_edge_id,
          e.deleted_at,
@@ -1668,6 +1917,9 @@ export function graphForFact(db: DB, factId: number): {
        JOIN entities s ON s.id = e.source_entity_id
        JOIN entities t ON t.id = e.target_entity_id
        JOIN edge_sources es ON es.edge_id = e.id
+       LEFT JOIN facts f ON f.id = es.fact_id
+       LEFT JOIN conversation_bursts b ON b.id = COALESCE(es.burst_id, f.source_burst_id, e.source_burst_id)
+       LEFT JOIN raw_messages rm ON rm.id = f.source_msg_id
        WHERE es.fact_id = ?
        ORDER BY e.predicate, s.display_name, t.display_name`
     )
@@ -2200,4 +2452,315 @@ export function listFactsMentioningEntity(
     .all(entityId, limit) as Array<
     ActiveFactRow & { mention_role: string; mention_text: string | null }
   >;
+}
+
+// ───────────── Append-only memory: groups + connections ─────────────
+
+export const CONNECTION_PREDICATES = [
+  'update',
+  'state_change',
+  'expands',
+  'qualifies',
+  'contradicts',
+  'retracts',
+  'same_as',
+] as const;
+
+export type ConnectionPredicate = (typeof CONNECTION_PREDICATES)[number];
+
+export interface MemoryGroupRow {
+  id: number;
+  name: string;
+  description: string | null;
+  owner_subject_wa_id: string | null;
+  created_at: number;
+  updated_at: number;
+  deleted_at: number | null;
+}
+
+export interface MemoryGroupInput {
+  name: string;
+  description?: string | null;
+  owner_subject_wa_id?: string | null;
+}
+
+export interface FactConnectionRow {
+  id: number;
+  from_fact_id: number;
+  to_fact_id: number;
+  predicate: ConnectionPredicate;
+  confidence: number;
+  reason: string | null;
+  source_agent_action_id: number | null;
+  created_at: number;
+}
+
+export interface FactConnectionInput {
+  from_fact_id: number;
+  to_fact_id: number;
+  predicate: ConnectionPredicate;
+  confidence?: number;
+  reason?: string | null;
+  source_agent_action_id?: number | null;
+}
+
+export function createMemoryGroup(db: DB, input: MemoryGroupInput): number {
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    const result = db
+      .prepare(
+        `INSERT INTO memory_groups (name, description, owner_subject_wa_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(
+        input.name,
+        input.description ?? null,
+        input.owner_subject_wa_id ?? null,
+        now,
+        now
+      );
+    return Number(result.lastInsertRowid);
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message.includes('UNIQUE')) {
+      // Same (owner, name) already exists — return its id rather than throwing.
+      const existing = db
+        .prepare(
+          `SELECT id FROM memory_groups
+           WHERE name = ? AND COALESCE(owner_subject_wa_id, '') = COALESCE(?, '')`
+        )
+        .get(input.name, input.owner_subject_wa_id ?? null) as
+        | { id: number }
+        | undefined;
+      if (existing) return existing.id;
+    }
+    throw err;
+  }
+}
+
+export function getMemoryGroup(db: DB, groupId: number): MemoryGroupRow | null {
+  const row = db
+    .prepare(
+      `SELECT id, name, description, owner_subject_wa_id,
+              created_at, updated_at, deleted_at
+       FROM memory_groups
+       WHERE id = ?`
+    )
+    .get(groupId) as MemoryGroupRow | undefined;
+  return row ?? null;
+}
+
+export interface ListMemoryGroupsFilter {
+  owner_subject_wa_id?: string | null;
+  /** Default true — exclude soft-deleted groups. */
+  active_only?: boolean;
+}
+
+export function listMemoryGroups(
+  db: DB,
+  filter: ListMemoryGroupsFilter = {}
+): MemoryGroupRow[] {
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (filter.active_only !== false) {
+    where.push('deleted_at IS NULL');
+  }
+  if (filter.owner_subject_wa_id !== undefined) {
+    if (filter.owner_subject_wa_id === null) {
+      where.push('owner_subject_wa_id IS NULL');
+    } else {
+      where.push('owner_subject_wa_id = ?');
+      params.push(filter.owner_subject_wa_id);
+    }
+  }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  return db
+    .prepare(
+      `SELECT id, name, description, owner_subject_wa_id,
+              created_at, updated_at, deleted_at
+       FROM memory_groups
+       ${clause}
+       ORDER BY id ASC`
+    )
+    .all(...params) as MemoryGroupRow[];
+}
+
+export function addFactToGroup(
+  db: DB,
+  args: { fact_id: number; group_id: number; source_agent_action_id?: number | null }
+): boolean {
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    db.prepare(
+      `INSERT INTO fact_group_membership (fact_id, group_id, attached_at, source_agent_action_id)
+       VALUES (?, ?, ?, ?)`
+    ).run(args.fact_id, args.group_id, now, args.source_agent_action_id ?? null);
+    return true;
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message.includes('UNIQUE')) {
+      // Already a member — idempotent no-op.
+      return false;
+    }
+    throw err;
+  }
+}
+
+export function listFactGroups(db: DB, factId: number): MemoryGroupRow[] {
+  return db
+    .prepare(
+      `SELECT g.id, g.name, g.description, g.owner_subject_wa_id,
+              g.created_at, g.updated_at, g.deleted_at
+       FROM fact_group_membership m
+       JOIN memory_groups g ON g.id = m.group_id
+       WHERE m.fact_id = ?
+         AND g.deleted_at IS NULL
+       ORDER BY m.attached_at ASC`
+    )
+    .all(factId) as MemoryGroupRow[];
+}
+
+export function listFactsInGroup(db: DB, groupId: number, limit = 200): ActiveFactRow[] {
+  return db
+    .prepare(
+      `SELECT f.id, f.subject_wa_id, f.category, f.content, f.confidence,
+              f.extracted_at, f.event_ts
+       FROM fact_group_membership m
+       JOIN facts f ON f.id = m.fact_id
+       WHERE m.group_id = ?
+         AND f.superseded_by_id IS NULL
+         AND f.deleted_at IS NULL
+       ORDER BY f.extracted_at DESC, f.id DESC
+       LIMIT ?`
+    )
+    .all(groupId, limit) as ActiveFactRow[];
+}
+
+export function insertFactConnection(db: DB, input: FactConnectionInput): number {
+  if (input.from_fact_id === input.to_fact_id) {
+    throw new Error(
+      `insertFactConnection: from_fact_id and to_fact_id must differ (got ${input.from_fact_id})`
+    );
+  }
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    const result = db
+      .prepare(
+        `INSERT INTO fact_connections
+           (from_fact_id, to_fact_id, predicate, confidence, reason,
+            source_agent_action_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        input.from_fact_id,
+        input.to_fact_id,
+        input.predicate,
+        input.confidence ?? 1.0,
+        input.reason ?? null,
+        input.source_agent_action_id ?? null,
+        now
+      );
+    return Number(result.lastInsertRowid);
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message.includes('UNIQUE')) {
+      // Same (from, to, predicate) edge already exists — return its id.
+      const existing = db
+        .prepare(
+          `SELECT id FROM fact_connections
+           WHERE from_fact_id = ? AND to_fact_id = ? AND predicate = ?`
+        )
+        .get(input.from_fact_id, input.to_fact_id, input.predicate) as
+        | { id: number }
+        | undefined;
+      if (existing) return existing.id;
+    }
+    throw err;
+  }
+}
+
+export function listConnectionsFromFact(
+  db: DB,
+  factId: number,
+  predicate?: ConnectionPredicate
+): FactConnectionRow[] {
+  if (predicate) {
+    return db
+      .prepare(
+        `SELECT id, from_fact_id, to_fact_id, predicate, confidence, reason,
+                source_agent_action_id, created_at
+         FROM fact_connections
+         WHERE from_fact_id = ? AND predicate = ?
+         ORDER BY created_at DESC, id DESC`
+      )
+      .all(factId, predicate) as FactConnectionRow[];
+  }
+  return db
+    .prepare(
+      `SELECT id, from_fact_id, to_fact_id, predicate, confidence, reason,
+              source_agent_action_id, created_at
+       FROM fact_connections
+       WHERE from_fact_id = ?
+       ORDER BY created_at DESC, id DESC`
+    )
+    .all(factId) as FactConnectionRow[];
+}
+
+export function listConnectionsToFact(
+  db: DB,
+  factId: number,
+  predicate?: ConnectionPredicate
+): FactConnectionRow[] {
+  if (predicate) {
+    return db
+      .prepare(
+        `SELECT id, from_fact_id, to_fact_id, predicate, confidence, reason,
+                source_agent_action_id, created_at
+         FROM fact_connections
+         WHERE to_fact_id = ? AND predicate = ?
+         ORDER BY created_at DESC, id DESC`
+      )
+      .all(factId, predicate) as FactConnectionRow[];
+  }
+  return db
+    .prepare(
+      `SELECT id, from_fact_id, to_fact_id, predicate, confidence, reason,
+              source_agent_action_id, created_at
+       FROM fact_connections
+       WHERE to_fact_id = ?
+       ORDER BY created_at DESC, id DESC`
+    )
+    .all(factId) as FactConnectionRow[];
+}
+
+/**
+ * Walk `update` and `state_change` predicate edges starting from `factId` to
+ * find the most recent fact in the chain. Stops if the chain forks (multiple
+ * incoming update edges), returning the originally-passed fact in that case
+ * — disambiguation is the caller's job (or a contradiction worth surfacing).
+ *
+ * Returns the original fact_id when no update chain exists.
+ */
+export function latestInChain(db: DB, factId: number): number {
+  const chainPredicates = ['update', 'state_change'] as const;
+  let current = factId;
+  const seen = new Set<number>([current]);
+  for (let i = 0; i < 32; i++) {
+    // Look for any newer fact (`from_fact_id`) whose target is `current`
+    // via an update / state_change predicate.
+    const next = db
+      .prepare(
+        `SELECT from_fact_id FROM fact_connections
+         WHERE to_fact_id = ?
+           AND predicate IN ('update', 'state_change')
+         ORDER BY created_at DESC, id DESC
+         LIMIT 2`
+      )
+      .all(current) as Array<{ from_fact_id: number }>;
+    if (next.length === 0) return current;
+    if (next.length > 1) return current; // fork — keep the original, contradictions handled elsewhere
+    const nextId = next[0].from_fact_id;
+    if (seen.has(nextId)) return current; // cycle guard
+    seen.add(nextId);
+    current = nextId;
+    void chainPredicates;
+  }
+  return current;
 }

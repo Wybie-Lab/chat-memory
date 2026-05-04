@@ -1,17 +1,16 @@
 import {
   insertFact,
+  insertFactConnection,
   insertEmbedding,
   markBurstFiltered,
   markBurstProcessed,
-  markFactSuperseded,
-  markFactDeleted,
-  deactivateGraphForFact,
   existingFactsForSubject,
   countActiveFactsForSubject,
   searchFactsForSubjectByVector,
   logProcessing,
   listUnprocessedBursts,
   getBurstMessages,
+  type ConnectionPredicate,
   type DB,
   type UnprocessedBurst,
   type ActiveFactRow,
@@ -213,8 +212,14 @@ async function processOne(
 
   type ResolvedOp =
     | { kind: 'add'; subject: string; fact: ExtractedFact }
-    | { kind: 'update'; subject: string; fact: ExtractedFact; oldId: number }
-    | { kind: 'delete'; oldId: number; reason: string }
+    | {
+        kind: 'connect';
+        subject: string;
+        fact: ExtractedFact;
+        oldId: number;
+        predicate: ConnectionPredicate;
+        reason: string;
+      }
     | { kind: 'drop'; fact: ExtractedFact; reason: string };
 
   const ops: ResolvedOp[] = [];
@@ -300,8 +305,8 @@ async function processOne(
   }
 
   const toEmbed = ops.filter(
-    (o): o is Extract<ResolvedOp, { kind: 'add' | 'update' }> =>
-      o.kind === 'add' || o.kind === 'update'
+    (o): o is Extract<ResolvedOp, { kind: 'add' | 'connect' }> =>
+      o.kind === 'add' || o.kind === 'connect'
   );
   const embedded = new Map<ResolvedOp, { vector: number[]; usage: { model: string; tokens_in: number; tokens_out: number } }>();
   for (const o of toEmbed) {
@@ -365,7 +370,7 @@ async function processOne(
         result.added++;
         recordCluster(o.subject, o.fact.category);
         log(`  burst ${burst.id} ADD [${o.fact.category}] about ${o.subject}: ${o.fact.content}`);
-      } else if (o.kind === 'update') {
+      } else if (o.kind === 'connect') {
         const e = embedded.get(o)!;
         const newId = insertFact(db, {
           source_burst_id: burst.id,
@@ -377,8 +382,17 @@ async function processOne(
           event_ts: o.fact.event_ts ?? null,
         });
         insertEmbedding(db, newId, e.vector);
-        markFactSuperseded(db, o.oldId, newId);
-        deactivateGraphForFact(db, o.oldId, 'superseded');
+        // Append-only: don't supersede or delete the old fact. Record a
+        // typed connection from the new fact back to the old one. The old
+        // row stays active and discoverable via retrieval; latestInChain()
+        // walks update/state_change edges at read time.
+        insertFactConnection(db, {
+          from_fact_id: newId,
+          to_fact_id: o.oldId,
+          predicate: o.predicate,
+          confidence: o.fact.confidence,
+          reason: o.reason,
+        });
         if (GRAPH_ENABLED) {
           graphJobs.push({
             fact_id: newId,
@@ -401,14 +415,10 @@ async function processOne(
         recordCluster(o.subject, o.fact.category);
         const old = oldFactCluster.get(o.oldId);
         if (old && old.category !== o.fact.category) recordCluster(old.subject, old.category);
-        log(`  burst ${burst.id} UPDATE fact ${o.oldId} → ${newId} about ${o.subject}: ${o.fact.content}`);
-      } else if (o.kind === 'delete') {
-        markFactDeleted(db, o.oldId);
-        deactivateGraphForFact(db, o.oldId, 'deleted');
-        result.deleted++;
-        const old = oldFactCluster.get(o.oldId);
-        if (old) recordCluster(old.subject, old.category);
-        log(`  burst ${burst.id} DELETE fact ${o.oldId} — ${o.reason}`);
+        log(
+          `  burst ${burst.id} CONNECT(${o.predicate}) fact ${newId} → ${o.oldId} ` +
+            `about ${o.subject}: ${o.fact.content}`
+        );
       } else {
         result.dropped++;
         log(`  burst ${burst.id} DROP candidate "${o.fact.content}" — ${o.reason}`);
@@ -531,8 +541,14 @@ function resolveOp(
   burstId: number
 ):
   | { kind: 'add'; subject: string; fact: ExtractedFact }
-  | { kind: 'update'; subject: string; fact: ExtractedFact; oldId: number }
-  | { kind: 'delete'; oldId: number; reason: string }
+  | {
+      kind: 'connect';
+      subject: string;
+      fact: ExtractedFact;
+      oldId: number;
+      predicate: ConnectionPredicate;
+      reason: string;
+    }
   | { kind: 'drop'; fact: ExtractedFact; reason: string }
   | null {
   if (op.op === 'ADD') {
@@ -557,16 +573,18 @@ function resolveOp(
       },
     };
   }
-  if (op.op === 'UPDATE') {
+  if (op.op === 'CONNECT') {
     if (consumedCandidates.has(op.candidate_index)) {
       log(`  burst ${burstId} CONSOLIDATE error: candidate ${op.candidate_index} consumed twice`);
       return null;
     }
     consumedCandidates.add(op.candidate_index);
     return {
-      kind: 'update',
+      kind: 'connect',
       subject,
       oldId: op.old_fact_id,
+      predicate: op.predicate,
+      reason: op.reason,
       fact: {
         subject,
         category: op.category,
@@ -575,9 +593,6 @@ function resolveOp(
         event_ts: candidates[op.candidate_index]?.event_ts ?? null,
       },
     };
-  }
-  if (op.op === 'DELETE') {
-    return { kind: 'delete', oldId: op.old_fact_id, reason: op.reason };
   }
   // DROP
   if (consumedCandidates.has(op.candidate_index)) {
