@@ -18,6 +18,16 @@ import {
   listGraphEntitiesWithStats,
   listKnowledgeEdges,
   graphForFact,
+  planAgentRun,
+  runCurator,
+  applyAgentRun,
+  applyAgentAction,
+  rejectAgentAction,
+  listAgentRuns,
+  getAgentRun,
+  getAgentAction,
+  listAgentActionsForRun,
+  type AgentRunStatus,
 } from '../engine';
 import { createLLMProvider } from '../llm';
 import {
@@ -275,6 +285,164 @@ app.post('/api/import-chat', (req: Request, res: Response) => {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
+
+// ───────────── Curator (proposal-only v1) ─────────────
+
+app.post('/api/curator/run', async (req: Request, res: Response) => {
+  try {
+    const body = req.body as {
+      scope_type?: unknown;
+      scope_ref?: unknown;
+      budget_ops?: unknown;
+      budget_llm_calls?: unknown;
+    };
+    const scopeType = body.scope_type;
+    if (scopeType !== 'subject' && scopeType !== 'entity') {
+      return res
+        .status(400)
+        .json({ error: "scope_type must be 'subject' or 'entity'" });
+    }
+    if (typeof body.scope_ref !== 'string' || !body.scope_ref.trim()) {
+      return res.status(400).json({ error: 'scope_ref is required' });
+    }
+    const budgetOps =
+      typeof body.budget_ops === 'number' && body.budget_ops > 0
+        ? Math.floor(body.budget_ops)
+        : undefined;
+    const budgetLlmCalls =
+      typeof body.budget_llm_calls === 'number' && body.budget_llm_calls > 0
+        ? Math.floor(body.budget_llm_calls)
+        : undefined;
+
+    const runId = planAgentRun(db, {
+      trigger: 'manual',
+      scope_type: scopeType,
+      scope_ref: body.scope_ref.trim(),
+      budget_ops: budgetOps,
+      budget_llm_calls: budgetLlmCalls,
+    });
+    const result = await runCurator(db, provider, runId);
+    const actions = listAgentActionsForRun(db, runId);
+    res.json({
+      run: result.run,
+      actions,
+      proposed_action_count: result.proposed_action_count,
+      llm_calls_used: result.llm_calls_used,
+      reasoning: result.reasoning,
+      error: result.error,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/curator/runs', (req: Request, res: Response) => {
+  try {
+    const status =
+      typeof req.query.status === 'string'
+        ? (req.query.status as AgentRunStatus)
+        : undefined;
+    const scopeType =
+      typeof req.query.scope_type === 'string'
+        ? (req.query.scope_type as 'subject' | 'entity')
+        : undefined;
+    const scopeRef =
+      typeof req.query.scope_ref === 'string' ? req.query.scope_ref : undefined;
+    const limit = req.query.limit ? Math.min(Number(req.query.limit), 200) : 50;
+    res.json({
+      runs: listAgentRuns(db, { status, scope_type: scopeType, scope_ref: scopeRef }, limit),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/curator/runs/:id', (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const runId = Number(req.params.id);
+    if (!Number.isInteger(runId) || runId <= 0) {
+      return res.status(400).json({ error: 'run id must be a positive integer' });
+    }
+    const run = getAgentRun(db, runId);
+    if (!run) return res.status(404).json({ error: `run ${runId} not found` });
+    res.json({ run, actions: listAgentActionsForRun(db, runId) });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Apply ALL proposed actions in a run, in seq order. Stale actions are
+// skipped; cluster summaries are refreshed after the fact mutations land.
+app.post('/api/curator/runs/:id/apply', async (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const runId = Number(req.params.id);
+    if (!Number.isInteger(runId) || runId <= 0) {
+      return res.status(400).json({ error: 'run id must be a positive integer' });
+    }
+    const approvedBy = approvedByFromBody(req.body);
+    const result = await applyAgentRun(db, provider, runId, { approvedBy });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Apply ONE proposed action in isolation. Run-level status is left untouched
+// so the caller can review/apply piecemeal before finalizing the run.
+app.post(
+  '/api/curator/actions/:id/apply',
+  async (req: Request<{ id: string }>, res: Response) => {
+    try {
+      const actionId = Number(req.params.id);
+      if (!Number.isInteger(actionId) || actionId <= 0) {
+        return res.status(400).json({ error: 'action id must be a positive integer' });
+      }
+      const approvedBy = approvedByFromBody(req.body);
+      const result = await applyAgentAction(db, provider, actionId, { approvedBy });
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+);
+
+app.post('/api/curator/actions/:id/reject', (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const actionId = Number(req.params.id);
+    if (!Number.isInteger(actionId) || actionId <= 0) {
+      return res.status(400).json({ error: 'action id must be a positive integer' });
+    }
+    const reason =
+      typeof (req.body as { reason?: unknown })?.reason === 'string'
+        ? ((req.body as { reason: string }).reason).trim()
+        : '';
+    if (!reason) return res.status(400).json({ error: 'reason is required' });
+    const action = rejectAgentAction(db, actionId, reason);
+    res.json({ action });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/curator/actions/:id', (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const actionId = Number(req.params.id);
+    if (!Number.isInteger(actionId) || actionId <= 0) {
+      return res.status(400).json({ error: 'action id must be a positive integer' });
+    }
+    const action = getAgentAction(db, actionId);
+    if (!action) return res.status(404).json({ error: `action ${actionId} not found` });
+    res.json({ action });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+function approvedByFromBody(body: unknown): string {
+  const raw = (body as { approved_by?: unknown })?.approved_by;
+  if (typeof raw === 'string' && raw.trim()) return raw.trim();
+  return 'user:web';
+}
 
 app.listen(port, () => {
   console.log(`manila web: http://localhost:${port}`);

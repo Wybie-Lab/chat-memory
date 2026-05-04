@@ -168,6 +168,43 @@ export type ConsolidationOp =
   | { op: 'DELETE'; old_fact_id: number; reason: string }
   | { op: 'DROP'; candidate_index: number; reason: string };
 
+// ───────────── Curator agent step ─────────────
+// One round-trip in the agent loop. The curator builds the prompt + tool
+// catalog from engine state; the provider produces the next batch of tool
+// calls. Tool dispatch and bookkeeping live in the engine, not here — the
+// provider only knows how to ask the model "what next?".
+
+export interface AgentToolDefinition {
+  name: string;
+  description: string;
+  /** JSON schema for the tool's arguments object. */
+  parameters: Record<string, unknown>;
+}
+
+export interface AgentToolCall {
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+export interface AgentHistoryEntry {
+  role: 'assistant' | 'tool';
+  /** Free-form text. Assistant entries echo the previous tool_calls + thinking;
+   *  tool entries are JSON-serialized results keyed by the call index. */
+  content: string;
+}
+
+export interface AgentStepInput {
+  systemPrompt: string;
+  userPrompt: string;
+  tools: AgentToolDefinition[];
+  history: AgentHistoryEntry[];
+}
+
+export interface AgentStepOutput {
+  thinking?: string;
+  tool_calls: AgentToolCall[];
+}
+
 export interface LLMProvider {
   filterBurst(input: BurstInput): Promise<FilterResult & { usage: UsageMetadata }>;
   extractBurst(input: BurstInput): Promise<{ facts: ExtractedFact[]; usage: UsageMetadata }>;
@@ -182,4 +219,7 @@ export interface LLMProvider {
   ): Promise<{ graph: ExtractedGraph; usage: UsageMetadata }>;
   embed(text: string, mode?: EmbedMode): Promise<{ vector: number[]; usage: UsageMetadata }>;
   chat(input: ChatInput): Promise<{ answer: string; usage: UsageMetadata }>;
+  agentStep(
+    input: AgentStepInput
+  ): Promise<{ output: AgentStepOutput; usage: UsageMetadata }>;
 }

@@ -455,6 +455,43 @@ export function insertFact(db: DB, fact: FactInput): number {
 }
 
 /**
+ * Insert a fact whose evidence is *derived from* one or more existing facts,
+ * not anchored to a single burst. Used by the curator's apply path when an
+ * UPDATE or MERGE produces a new fact whose sources are inherited from the
+ * facts being superseded. Leaves the legacy `source_burst_id` /
+ * `source_msg_id` columns NULL (they're nullable in the schema); evidence is
+ * tracked exclusively via `fact_sources`, populated by the caller via
+ * `copyFactSourcesUnion`.
+ */
+export function insertAgentDerivedFact(
+  db: DB,
+  args: {
+    subject: string;
+    category: string;
+    content: string;
+    confidence: number;
+    event_ts?: number | null;
+  }
+): number {
+  const now = Math.floor(Date.now() / 1000);
+  const result = db
+    .prepare(
+      `INSERT INTO facts
+         (source_msg_id, source_burst_id, subject_wa_id, category, content, confidence, extracted_at, event_ts)
+       VALUES (NULL, NULL, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      args.subject,
+      args.category,
+      args.content,
+      args.confidence,
+      now,
+      args.event_ts ?? null
+    );
+  return Number(result.lastInsertRowid);
+}
+
+/**
  * Attach an additional supporting source to an existing fact. Used when the
  * consolidator confirms an existing fact via a new burst — instead of inserting
  * a duplicate, we record that another piece of evidence backs it. Importance
@@ -1622,4 +1659,468 @@ export function graphForFact(db: DB, factId: number): {
     })),
     edges: edges.map(rowToKnowledgeEdge),
   };
+}
+
+// ───────────── Curator agent: runs + proposed actions ─────────────
+
+export type AgentTrigger = 'manual' | 'entity_signal' | 'scheduled';
+export type AgentScopeType = 'subject' | 'entity';
+export type AgentRunStatus =
+  | 'planned'
+  | 'running'
+  | 'proposed'
+  | 'applied'
+  | 'rejected'
+  | 'failed';
+export type AgentActionOp = 'update' | 'delete' | 'merge';
+export type AgentActionStatus = 'proposed' | 'applied' | 'rejected' | 'skipped';
+
+export interface AgentRunInput {
+  trigger: AgentTrigger;
+  scope_type: AgentScopeType;
+  scope_ref: string;
+  trigger_fact_id?: number | null;
+  budget_ops: number;
+  budget_llm_calls: number;
+}
+
+export interface AgentRunRow {
+  id: number;
+  trigger: AgentTrigger;
+  scope_type: AgentScopeType;
+  scope_ref: string;
+  trigger_fact_id: number | null;
+  status: AgentRunStatus;
+  budget_ops: number;
+  budget_llm_calls: number;
+  llm_calls_used: number;
+  reasoning: string | null;
+  error: string | null;
+  started_at: number;
+  completed_at: number | null;
+  applied_at: number | null;
+  approved_by: string | null;
+}
+
+export interface AgentActionInput {
+  run_id: number;
+  seq: number;
+  op: AgentActionOp;
+  target_fact_id?: number | null;
+  new_content?: string | null;
+  new_category?: string | null;
+  merge_fact_ids?: number[] | null;
+  citing_fact_ids: number[];
+  reason: string;
+  confidence: number;
+}
+
+export interface AgentActionRow {
+  id: number;
+  run_id: number;
+  seq: number;
+  op: AgentActionOp;
+  target_fact_id: number | null;
+  new_content: string | null;
+  new_category: string | null;
+  merge_fact_ids: number[] | null;
+  citing_fact_ids: number[];
+  reason: string;
+  confidence: number;
+  status: AgentActionStatus;
+  applied_fact_id: number | null;
+  rejected_reason: string | null;
+  created_at: number;
+  applied_at: number | null;
+}
+
+export function insertAgentRun(db: DB, input: AgentRunInput): number {
+  const now = Math.floor(Date.now() / 1000);
+  const result = db
+    .prepare(
+      `INSERT INTO agent_runs
+         (trigger, scope_type, scope_ref, trigger_fact_id,
+          status, budget_ops, budget_llm_calls, started_at)
+       VALUES (?, ?, ?, ?, 'planned', ?, ?, ?)`
+    )
+    .run(
+      input.trigger,
+      input.scope_type,
+      input.scope_ref,
+      input.trigger_fact_id ?? null,
+      input.budget_ops,
+      input.budget_llm_calls,
+      now
+    );
+  return Number(result.lastInsertRowid);
+}
+
+export function setAgentRunStatus(
+  db: DB,
+  runId: number,
+  status: AgentRunStatus,
+  extra: { reasoning?: string | null; error?: string | null } = {}
+): void {
+  const now = Math.floor(Date.now() / 1000);
+  const completed = status === 'proposed' || status === 'failed' || status === 'rejected'
+    ? now
+    : null;
+  db.prepare(
+    `UPDATE agent_runs
+       SET status = ?,
+           reasoning = COALESCE(?, reasoning),
+           error = COALESCE(?, error),
+           completed_at = COALESCE(?, completed_at)
+     WHERE id = ?`
+  ).run(status, extra.reasoning ?? null, extra.error ?? null, completed, runId);
+}
+
+export function incrementAgentRunLlmCalls(db: DB, runId: number): void {
+  db.prepare('UPDATE agent_runs SET llm_calls_used = llm_calls_used + 1 WHERE id = ?').run(
+    runId
+  );
+}
+
+export function getAgentRun(db: DB, runId: number): AgentRunRow | null {
+  const row = db
+    .prepare(
+      `SELECT id, trigger, scope_type, scope_ref, trigger_fact_id,
+              status, budget_ops, budget_llm_calls, llm_calls_used,
+              reasoning, error, started_at, completed_at, applied_at, approved_by
+       FROM agent_runs
+       WHERE id = ?`
+    )
+    .get(runId) as AgentRunRow | undefined;
+  return row ?? null;
+}
+
+export interface ListAgentRunsFilter {
+  status?: AgentRunStatus;
+  scope_type?: AgentScopeType;
+  scope_ref?: string;
+}
+
+export function listAgentRuns(
+  db: DB,
+  filter: ListAgentRunsFilter = {},
+  limit = 100
+): AgentRunRow[] {
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (filter.status) {
+    where.push('status = ?');
+    params.push(filter.status);
+  }
+  if (filter.scope_type) {
+    where.push('scope_type = ?');
+    params.push(filter.scope_type);
+  }
+  if (filter.scope_ref) {
+    where.push('scope_ref = ?');
+    params.push(filter.scope_ref);
+  }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  params.push(limit);
+  return db
+    .prepare(
+      `SELECT id, trigger, scope_type, scope_ref, trigger_fact_id,
+              status, budget_ops, budget_llm_calls, llm_calls_used,
+              reasoning, error, started_at, completed_at, applied_at, approved_by
+       FROM agent_runs
+       ${clause}
+       ORDER BY id DESC
+       LIMIT ?`
+    )
+    .all(...params) as AgentRunRow[];
+}
+
+export function insertAgentAction(db: DB, input: AgentActionInput): number {
+  if (!Array.isArray(input.citing_fact_ids) || input.citing_fact_ids.length === 0) {
+    throw new Error('insertAgentAction: citing_fact_ids must contain at least one id');
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const result = db
+    .prepare(
+      `INSERT INTO agent_actions
+         (run_id, seq, op, target_fact_id, new_content, new_category,
+          merge_fact_ids_json, citing_fact_ids_json, reason, confidence,
+          status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)`
+    )
+    .run(
+      input.run_id,
+      input.seq,
+      input.op,
+      input.target_fact_id ?? null,
+      input.new_content ?? null,
+      input.new_category ?? null,
+      input.merge_fact_ids ? JSON.stringify(input.merge_fact_ids) : null,
+      JSON.stringify(input.citing_fact_ids),
+      input.reason,
+      input.confidence,
+      now
+    );
+  return Number(result.lastInsertRowid);
+}
+
+function rowToAgentAction(r: {
+  id: number;
+  run_id: number;
+  seq: number;
+  op: AgentActionOp;
+  target_fact_id: number | null;
+  new_content: string | null;
+  new_category: string | null;
+  merge_fact_ids_json: string | null;
+  citing_fact_ids_json: string;
+  reason: string;
+  confidence: number;
+  status: AgentActionStatus;
+  applied_fact_id: number | null;
+  rejected_reason: string | null;
+  created_at: number;
+  applied_at: number | null;
+}): AgentActionRow {
+  return {
+    id: r.id,
+    run_id: r.run_id,
+    seq: r.seq,
+    op: r.op,
+    target_fact_id: r.target_fact_id,
+    new_content: r.new_content,
+    new_category: r.new_category,
+    merge_fact_ids: r.merge_fact_ids_json
+      ? (JSON.parse(r.merge_fact_ids_json) as number[])
+      : null,
+    citing_fact_ids: JSON.parse(r.citing_fact_ids_json) as number[],
+    reason: r.reason,
+    confidence: r.confidence,
+    status: r.status,
+    applied_fact_id: r.applied_fact_id,
+    rejected_reason: r.rejected_reason,
+    created_at: r.created_at,
+    applied_at: r.applied_at,
+  };
+}
+
+export function listAgentActionsForRun(db: DB, runId: number): AgentActionRow[] {
+  const rows = db
+    .prepare(
+      `SELECT id, run_id, seq, op, target_fact_id, new_content, new_category,
+              merge_fact_ids_json, citing_fact_ids_json, reason, confidence,
+              status, applied_fact_id, rejected_reason, created_at, applied_at
+       FROM agent_actions
+       WHERE run_id = ?
+       ORDER BY seq ASC, id ASC`
+    )
+    .all(runId) as Parameters<typeof rowToAgentAction>[0][];
+  return rows.map(rowToAgentAction);
+}
+
+export function countAgentActionsForRun(db: DB, runId: number): number {
+  const row = db
+    .prepare('SELECT COUNT(*) AS n FROM agent_actions WHERE run_id = ?')
+    .get(runId) as { n: number };
+  return row.n;
+}
+
+export function getAgentAction(db: DB, actionId: number): AgentActionRow | null {
+  const row = db
+    .prepare(
+      `SELECT id, run_id, seq, op, target_fact_id, new_content, new_category,
+              merge_fact_ids_json, citing_fact_ids_json, reason, confidence,
+              status, applied_fact_id, rejected_reason, created_at, applied_at
+       FROM agent_actions
+       WHERE id = ?`
+    )
+    .get(actionId) as Parameters<typeof rowToAgentAction>[0] | undefined;
+  return row ? rowToAgentAction(row) : null;
+}
+
+export function setAgentActionApplied(
+  db: DB,
+  actionId: number,
+  appliedFactId: number | null
+): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `UPDATE agent_actions
+       SET status = 'applied', applied_fact_id = ?, applied_at = ?
+     WHERE id = ?`
+  ).run(appliedFactId, now, actionId);
+}
+
+export function setAgentActionRejected(
+  db: DB,
+  actionId: number,
+  reason: string
+): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `UPDATE agent_actions
+       SET status = 'rejected', rejected_reason = ?, applied_at = ?
+     WHERE id = ?`
+  ).run(reason, now, actionId);
+}
+
+export function setAgentActionSkipped(
+  db: DB,
+  actionId: number,
+  reason: string
+): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `UPDATE agent_actions
+       SET status = 'skipped', rejected_reason = ?, applied_at = ?
+     WHERE id = ?`
+  ).run(reason, now, actionId);
+}
+
+export function setAgentRunApplied(
+  db: DB,
+  runId: number,
+  approvedBy: string
+): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `UPDATE agent_runs
+       SET status = 'applied', applied_at = ?, approved_by = ?
+     WHERE id = ?`
+  ).run(now, approvedBy, runId);
+}
+
+export function setAgentRunRejected(
+  db: DB,
+  runId: number,
+  approvedBy: string
+): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `UPDATE agent_runs
+       SET status = 'rejected', applied_at = ?, approved_by = ?
+     WHERE id = ?`
+  ).run(now, approvedBy, runId);
+}
+
+/**
+ * For each unique (source_burst_id, source_msg_id) pair across the source
+ * facts that does NOT already match a row in `fact_sources` for `targetFactId`,
+ * insert one. Used by the apply path: when an UPDATE/MERGE produces a new fact,
+ * the new fact inherits evidence from every fact it derives from. The initial
+ * insertFact call already attaches one (burst, msg) pair from the legacy
+ * column args; this helper unions the rest.
+ */
+export function copyFactSourcesUnion(
+  db: DB,
+  sourceFactIds: number[],
+  targetFactId: number
+): number {
+  if (sourceFactIds.length === 0) return 0;
+  const now = Math.floor(Date.now() / 1000);
+  const placeholders = sourceFactIds.map(() => '?').join(',');
+  const allSources = db
+    .prepare(
+      `SELECT DISTINCT source_burst_id, source_msg_id
+       FROM fact_sources
+       WHERE fact_id IN (${placeholders})`
+    )
+    .all(...sourceFactIds) as Array<{
+    source_burst_id: number | null;
+    source_msg_id: number | null;
+  }>;
+
+  const existing = db
+    .prepare(
+      `SELECT source_burst_id, source_msg_id
+       FROM fact_sources
+       WHERE fact_id = ?`
+    )
+    .all(targetFactId) as Array<{
+    source_burst_id: number | null;
+    source_msg_id: number | null;
+  }>;
+  const existingKey = new Set(
+    existing.map((r) => `${r.source_burst_id ?? 'null'}|${r.source_msg_id ?? 'null'}`)
+  );
+
+  const insert = db.prepare(
+    `INSERT INTO fact_sources (fact_id, source_burst_id, source_msg_id, attached_at)
+     VALUES (?, ?, ?, ?)`
+  );
+  let added = 0;
+  for (const s of allSources) {
+    const key = `${s.source_burst_id ?? 'null'}|${s.source_msg_id ?? 'null'}`;
+    if (existingKey.has(key)) continue;
+    if (s.source_burst_id === null && s.source_msg_id === null) continue;
+    insert.run(targetFactId, s.source_burst_id, s.source_msg_id, now);
+    existingKey.add(key);
+    added++;
+  }
+  return added;
+}
+
+// Read helpers used by the curator's read tools. These are lightweight wrappers
+// around existing queries — kept here so the agent module never reaches into
+// db.ts internals.
+
+export interface FactWithSourceBursts {
+  fact: ActiveFactRow;
+  bursts: Array<{ burst_id: number; messages: BurstMessage[] }>;
+}
+
+export function getActiveFact(db: DB, factId: number): ActiveFactRow | null {
+  const row = db
+    .prepare(
+      `SELECT id, subject_wa_id, category, content, confidence, extracted_at, event_ts
+       FROM facts
+       WHERE id = ?
+         AND superseded_by_id IS NULL
+         AND deleted_at IS NULL`
+    )
+    .get(factId) as ActiveFactRow | undefined;
+  return row ?? null;
+}
+
+export function getFactSourceBursts(
+  db: DB,
+  factId: number,
+  burstLimit = 3
+): Array<{ burst_id: number; messages: BurstMessage[] }> {
+  const burstIds = db
+    .prepare(
+      `SELECT DISTINCT source_burst_id AS id
+       FROM fact_sources
+       WHERE fact_id = ? AND source_burst_id IS NOT NULL
+       ORDER BY attached_at DESC
+       LIMIT ?`
+    )
+    .all(factId, burstLimit) as Array<{ id: number }>;
+
+  return burstIds.map((b) => ({
+    burst_id: b.id,
+    messages: getBurstMessages(db, b.id),
+  }));
+}
+
+export function listFactsMentioningEntity(
+  db: DB,
+  entityId: number,
+  limit = 100
+): Array<ActiveFactRow & { mention_role: string; mention_text: string | null }> {
+  return db
+    .prepare(
+      `SELECT
+         f.id, f.subject_wa_id, f.category, f.content, f.confidence, f.extracted_at, f.event_ts,
+         m.role AS mention_role, m.mention_text AS mention_text
+       FROM fact_entity_mentions m
+       JOIN facts f ON f.id = m.fact_id
+       WHERE m.entity_id = ?
+         AND f.superseded_by_id IS NULL
+         AND f.deleted_at IS NULL
+       ORDER BY f.id DESC
+       LIMIT ?`
+    )
+    .all(entityId, limit) as Array<
+    ActiveFactRow & { mention_role: string; mention_text: string | null }
+  >;
 }

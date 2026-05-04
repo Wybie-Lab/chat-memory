@@ -181,3 +181,57 @@ CREATE TABLE IF NOT EXISTS edge_sources (
 );
 
 CREATE INDEX IF NOT EXISTS idx_edge_sources_fact ON edge_sources(fact_id);
+
+-- Curator agent runs. The agent reads existing facts/entities and proposes
+-- mutations (UPDATE/DELETE/MERGE) to be applied later. Nothing in agent_runs
+-- or agent_actions touches the facts table directly — application is a
+-- separate gated step (see applyRun / agent_actions.status flow).
+CREATE TABLE IF NOT EXISTS agent_runs (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  trigger             TEXT NOT NULL,         -- 'manual' | 'entity_signal' | 'scheduled'
+  scope_type          TEXT NOT NULL,         -- 'subject' | 'entity'
+  scope_ref           TEXT NOT NULL,         -- subject_wa_id or entity_id (as text)
+  trigger_fact_id     INTEGER REFERENCES facts(id),
+  status              TEXT NOT NULL DEFAULT 'planned',
+                                             -- 'planned' | 'running' | 'proposed'
+                                             -- | 'applied' | 'rejected' | 'failed'
+  budget_ops          INTEGER NOT NULL,
+  budget_llm_calls    INTEGER NOT NULL,
+  llm_calls_used      INTEGER NOT NULL DEFAULT 0,
+  reasoning           TEXT,                  -- agent's final summary
+  error               TEXT,                  -- on 'failed'
+  started_at          INTEGER NOT NULL,
+  completed_at        INTEGER,
+  applied_at          INTEGER,
+  approved_by         TEXT                   -- 'auto' | 'user:<name>' | NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_runs_status ON agent_runs(status);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_scope ON agent_runs(scope_type, scope_ref);
+
+-- Proposed mutations from a curator run. status='proposed' until either
+-- applied (creates / supersedes / soft-deletes facts in the apply path) or
+-- rejected by a reviewer. citing_fact_ids_json is required (≥1) so every
+-- proposal is grounded in existing memory.
+CREATE TABLE IF NOT EXISTS agent_actions (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id               INTEGER NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+  seq                  INTEGER NOT NULL,    -- order within the run
+  op                   TEXT NOT NULL,       -- 'update' | 'delete' | 'merge'
+  target_fact_id       INTEGER REFERENCES facts(id),
+  new_content          TEXT,
+  new_category         TEXT,
+  merge_fact_ids_json  TEXT,                -- for 'merge': source fact ids being collapsed
+  citing_fact_ids_json TEXT NOT NULL,       -- ≥1 required, validated at insert time
+  reason               TEXT NOT NULL,
+  confidence           REAL NOT NULL,
+  status               TEXT NOT NULL DEFAULT 'proposed',
+                                            -- 'proposed' | 'applied' | 'rejected' | 'skipped'
+  applied_fact_id      INTEGER REFERENCES facts(id),
+  rejected_reason      TEXT,
+  created_at           INTEGER NOT NULL,
+  applied_at           INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_actions_run ON agent_actions(run_id);
+CREATE INDEX IF NOT EXISTS idx_agent_actions_status ON agent_actions(status);
