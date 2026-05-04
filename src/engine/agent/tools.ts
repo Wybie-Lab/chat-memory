@@ -16,13 +16,17 @@
 import type { Tool, ToolSet } from 'ai';
 import { z } from 'zod';
 import {
+  CONNECTION_PREDICATES,
   countActiveFactsForSubject,
   countAgentActionsForRun,
   factsAboutSubject,
   getActiveFact,
   getFactSourceBursts,
+  getMemoryThread,
   insertAgentAction,
+  listFactsInThread,
   listFactsMentioningEntity,
+  listMemoryThreads,
   searchFactsForSubjectByVector,
   type ActiveFactRow,
   type AgentActionOp,
@@ -165,53 +169,64 @@ export function buildCuratorTools(ctx: CuratorContext): CuratorToolSet {
     },
   });
 
-  const propose_update = defineTool({
+  const list_threads_for_subject = defineTool({
     description:
-      'Propose superseding an active fact with a richer/corrected version. The new content becomes a new fact row; the old one is marked superseded on apply. Requires at least one citing_fact_id (typically the target itself plus any fact that justifies the change).',
+      'List existing memory threads for a subject. Threads are topical buckets (e.g. "Nico (her dog)", "career", "music tastes"). If subject_wa_id is omitted, uses the run scope.',
     inputSchema: z.object({
-      target_fact_id: z.number().int().positive(),
-      new_content: z.string().min(1),
-      new_category: FactCategoryZ.optional(),
-      citing_fact_ids: z.array(z.number().int().positive()).min(1),
-      reason: z.string().min(1),
-      confidence: z.number().min(0).max(1),
+      subject_wa_id: z.string().optional(),
     }),
-    execute: async (args) => {
-      const budgetErr = checkBudget(ctx);
-      if (budgetErr) return errorResult(budgetErr);
-      const targetFact = getActiveFact(ctx.db, args.target_fact_id);
-      if (!targetFact) {
-        return errorResult(`target_fact_id ${args.target_fact_id} is not active`);
+    execute: async ({ subject_wa_id }) => {
+      const subject =
+        subject_wa_id ?? (ctx.run.scope_type === 'subject' ? ctx.run.scope_ref : null);
+      if (!subject) {
+        return errorResult(
+          'subject_wa_id required (run scope is not a subject — pass it explicitly)'
+        );
       }
-      const citingErr = ensureCitingActive(ctx, args.citing_fact_ids);
-      if (citingErr) return errorResult(citingErr);
-      const id = insertAgentAction(ctx.db, {
-        run_id: ctx.run.id,
-        seq: ctx.nextSeq(),
-        op: 'update' as AgentActionOp,
-        target_fact_id: args.target_fact_id,
-        new_content: args.new_content,
-        new_category: args.new_category ?? null,
-        citing_fact_ids: args.citing_fact_ids,
-        reason: args.reason,
-        confidence: args.confidence,
-      });
+      const threads = listMemoryThreads(ctx.db, { owner_subject_wa_id: subject });
       return {
         ok: true,
-        action_id: id,
-        op: 'update',
-        target_fact_id: args.target_fact_id,
-        new_content: args.new_content,
-        new_category: args.new_category ?? null,
+        subject_wa_id: subject,
+        threads: threads.map((t) => ({
+          id: t.id,
+          name: t.name,
+          description: t.description,
+          created_at: t.created_at,
+        })),
       };
     },
   });
 
-  const propose_delete = defineTool({
+  const list_facts_in_thread_tool = defineTool({
     description:
-      'Propose soft-deleting an active fact that is now wrong or obsolete. Cite the fact(s) that contradict or supersede it.',
+      'List active facts attached to a thread. Use this to inspect a thread before deciding whether to add or move facts.',
     inputSchema: z.object({
-      target_fact_id: z.number().int().positive(),
+      thread_id: z.number().int().positive(),
+      limit: z.number().int().min(1).max(200).optional(),
+    }),
+    execute: async ({ thread_id, limit }) => {
+      const thread = getMemoryThread(ctx.db, thread_id);
+      if (!thread) return errorResult(`thread ${thread_id} not found`);
+      const facts = listFactsInThread(ctx.db, thread_id, limit ?? 50);
+      return {
+        ok: true,
+        thread: {
+          id: thread.id,
+          name: thread.name,
+          description: thread.description,
+        },
+        facts: facts.map(serializeFact),
+      };
+    },
+  });
+
+  const propose_connect = defineTool({
+    description:
+      'Propose a typed connection between two existing facts. The new edge will be inserted into fact_connections on apply. Use this when two existing facts relate to each other in a way the burst pipeline missed (e.g. one updates the other, expands it, contradicts it). Both facts must be active.',
+    inputSchema: z.object({
+      from_fact_id: z.number().int().positive(),
+      to_fact_id: z.number().int().positive(),
+      predicate: z.enum(CONNECTION_PREDICATES),
       citing_fact_ids: z.array(z.number().int().positive()).min(1),
       reason: z.string().min(1),
       confidence: z.number().min(0).max(1),
@@ -219,68 +234,26 @@ export function buildCuratorTools(ctx: CuratorContext): CuratorToolSet {
     execute: async (args) => {
       const budgetErr = checkBudget(ctx);
       if (budgetErr) return errorResult(budgetErr);
-      if (!getActiveFact(ctx.db, args.target_fact_id)) {
-        return errorResult(`target_fact_id ${args.target_fact_id} is not active`);
+      if (args.from_fact_id === args.to_fact_id) {
+        return errorResult('from_fact_id and to_fact_id must differ');
+      }
+      if (!getActiveFact(ctx.db, args.from_fact_id)) {
+        return errorResult(`from_fact_id ${args.from_fact_id} is not active`);
+      }
+      if (!getActiveFact(ctx.db, args.to_fact_id)) {
+        return errorResult(`to_fact_id ${args.to_fact_id} is not active`);
       }
       const citingErr = ensureCitingActive(ctx, args.citing_fact_ids);
       if (citingErr) return errorResult(citingErr);
       const id = insertAgentAction(ctx.db, {
         run_id: ctx.run.id,
         seq: ctx.nextSeq(),
-        op: 'delete' as AgentActionOp,
-        target_fact_id: args.target_fact_id,
-        citing_fact_ids: args.citing_fact_ids,
-        reason: args.reason,
-        confidence: args.confidence,
-      });
-      return { ok: true, action_id: id, op: 'delete', target_fact_id: args.target_fact_id };
-    },
-  });
-
-  const propose_merge = defineTool({
-    description:
-      'Propose collapsing N near-duplicate facts about the same subject into one canonical fact. All listed fact_ids will be superseded by a new fact with the canonical content. citing_fact_ids must include every fact_id being merged.',
-    inputSchema: z.object({
-      fact_ids: z.array(z.number().int().positive()).min(2),
-      canonical_content: z.string().min(1),
-      canonical_category: FactCategoryZ,
-      citing_fact_ids: z.array(z.number().int().positive()).min(2),
-      reason: z.string().min(1),
-      confidence: z.number().min(0).max(1),
-    }),
-    execute: async (args) => {
-      const budgetErr = checkBudget(ctx);
-      if (budgetErr) return errorResult(budgetErr);
-      // All facts must be active and share the same subject.
-      let subject: string | null = null;
-      for (const fid of args.fact_ids) {
-        const f = getActiveFact(ctx.db, fid);
-        if (!f) return errorResult(`fact_id ${fid} in merge is not active`);
-        if (subject === null) subject = f.subject_wa_id;
-        else if (f.subject_wa_id !== subject) {
-          return errorResult(
-            `merge facts must share the same subject — got ${subject} and ${f.subject_wa_id}`
-          );
-        }
-      }
-      const citingSet = new Set(args.citing_fact_ids);
-      for (const fid of args.fact_ids) {
-        if (!citingSet.has(fid)) {
-          return errorResult(
-            `citing_fact_ids must include every merged fact_id; missing ${fid}`
-          );
-        }
-      }
-      const citingErr = ensureCitingActive(ctx, args.citing_fact_ids);
-      if (citingErr) return errorResult(citingErr);
-
-      const id = insertAgentAction(ctx.db, {
-        run_id: ctx.run.id,
-        seq: ctx.nextSeq(),
-        op: 'merge' as AgentActionOp,
-        new_content: args.canonical_content,
-        new_category: args.canonical_category,
-        merge_fact_ids: args.fact_ids,
+        op: 'connect' as AgentActionOp,
+        target_fact_id: args.from_fact_id,
+        extra: {
+          secondary_fact_id: args.to_fact_id,
+          predicate: args.predicate,
+        },
         citing_fact_ids: args.citing_fact_ids,
         reason: args.reason,
         confidence: args.confidence,
@@ -288,10 +261,109 @@ export function buildCuratorTools(ctx: CuratorContext): CuratorToolSet {
       return {
         ok: true,
         action_id: id,
-        op: 'merge',
-        fact_ids: args.fact_ids,
-        canonical_content: args.canonical_content,
-        canonical_category: args.canonical_category,
+        op: 'connect',
+        from_fact_id: args.from_fact_id,
+        to_fact_id: args.to_fact_id,
+        predicate: args.predicate,
+      };
+    },
+  });
+
+  const propose_assign_thread = defineTool({
+    description:
+      'Propose attaching an existing fact to an existing thread. Use this when a fact belongs to a thread it is currently not in (the burst pipeline\'s thread assignment missed it, or the thread was created later). The fact-thread membership is many-to-many; you can attach the same fact to multiple threads via multiple calls.',
+    inputSchema: z.object({
+      fact_id: z.number().int().positive(),
+      thread_id: z.number().int().positive(),
+      citing_fact_ids: z.array(z.number().int().positive()).min(1),
+      reason: z.string().min(1),
+      confidence: z.number().min(0).max(1),
+    }),
+    execute: async (args) => {
+      const budgetErr = checkBudget(ctx);
+      if (budgetErr) return errorResult(budgetErr);
+      if (!getActiveFact(ctx.db, args.fact_id)) {
+        return errorResult(`fact_id ${args.fact_id} is not active`);
+      }
+      const thread = getMemoryThread(ctx.db, args.thread_id);
+      if (!thread || thread.deleted_at !== null) {
+        return errorResult(`thread_id ${args.thread_id} not found or deleted`);
+      }
+      const citingErr = ensureCitingActive(ctx, args.citing_fact_ids);
+      if (citingErr) return errorResult(citingErr);
+      const id = insertAgentAction(ctx.db, {
+        run_id: ctx.run.id,
+        seq: ctx.nextSeq(),
+        op: 'assign_thread' as AgentActionOp,
+        target_fact_id: args.fact_id,
+        extra: { thread_id: args.thread_id },
+        citing_fact_ids: args.citing_fact_ids,
+        reason: args.reason,
+        confidence: args.confidence,
+      });
+      return {
+        ok: true,
+        action_id: id,
+        op: 'assign_thread',
+        fact_id: args.fact_id,
+        thread_id: args.thread_id,
+      };
+    },
+  });
+
+  const propose_create_thread = defineTool({
+    description:
+      'Propose creating a new memory thread, optionally attaching one or more existing facts to it on apply. Use this when several facts belong to a topical bucket that doesn\'t exist yet (e.g. a new pet, project, trip). The owner_subject_wa_id defaults to the run scope when scope_type=subject; pass null explicitly for cross-subject threads.',
+    inputSchema: z.object({
+      name: z.string().min(1).max(80),
+      description: z.string().max(500).optional(),
+      owner_subject_wa_id: z.string().nullable().optional(),
+      attached_fact_ids: z.array(z.number().int().positive()).default([]),
+      citing_fact_ids: z.array(z.number().int().positive()).min(1),
+      reason: z.string().min(1),
+      confidence: z.number().min(0).max(1),
+    }),
+    execute: async (args) => {
+      const budgetErr = checkBudget(ctx);
+      if (budgetErr) return errorResult(budgetErr);
+      // Default owner from run scope if not given.
+      const owner: string | null =
+        args.owner_subject_wa_id !== undefined
+          ? args.owner_subject_wa_id
+          : ctx.run.scope_type === 'subject'
+            ? ctx.run.scope_ref
+            : null;
+      const attached = args.attached_fact_ids ?? [];
+      // All attached facts must be active.
+      for (const fid of attached) {
+        if (!getActiveFact(ctx.db, fid)) {
+          return errorResult(`attached_fact_id ${fid} is not active`);
+        }
+      }
+      const citingErr = ensureCitingActive(ctx, args.citing_fact_ids);
+      if (citingErr) return errorResult(citingErr);
+      const id = insertAgentAction(ctx.db, {
+        run_id: ctx.run.id,
+        seq: ctx.nextSeq(),
+        op: 'create_thread' as AgentActionOp,
+        target_fact_id: attached.length > 0 ? attached[0] : null,
+        extra: {
+          name: args.name,
+          description: args.description ?? null,
+          owner_subject_wa_id: owner,
+          attached_fact_ids: attached,
+        },
+        citing_fact_ids: args.citing_fact_ids,
+        reason: args.reason,
+        confidence: args.confidence,
+      });
+      return {
+        ok: true,
+        action_id: id,
+        op: 'create_thread',
+        name: args.name,
+        owner_subject_wa_id: owner,
+        attached_fact_ids: attached,
       };
     },
   });
@@ -301,9 +373,11 @@ export function buildCuratorTools(ctx: CuratorContext): CuratorToolSet {
     get_fact_sources,
     search_similar_facts,
     list_facts_mentioning_entity,
-    propose_update,
-    propose_delete,
-    propose_merge,
+    list_threads_for_subject,
+    list_facts_in_thread: list_facts_in_thread_tool,
+    propose_connect,
+    propose_assign_thread,
+    propose_create_thread,
   };
 }
 

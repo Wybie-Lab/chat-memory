@@ -1,49 +1,43 @@
 /**
- * Apply path for curator agent runs.
+ * Apply path for curator agent runs (append-only memory model).
  *
- * `applyAgentRun(runId, approvedBy)` walks every action in 'proposed' status
- * for the run and turns it into a real fact mutation, in seq order:
- *   - update → insertFact + markFactSuperseded(target → new) + carry sources
- *   - delete → markFactDeleted(target)
- *   - merge  → insertFact + markFactSuperseded(each merged_id → new) + union sources
+ * The curator's job is to ORGANIZE existing memory, not mutate it. The apply
+ * path therefore only writes graph-structure rows:
  *
- * Pre-flight: every action's target_fact_id, merge_fact_ids, and citing_fact_ids
- * must still be active. If anything is stale (already superseded/deleted by
- * another path between propose and apply), the action is marked 'skipped' with
- * a reason — we never apply a half-stale proposal.
+ *   - connect       → fact_connections row between two existing facts
+ *   - assign_thread → fact_thread_membership row
+ *   - create_thread → memory_threads row + (optional) memberships
  *
- * The fact mutations + action status writes happen in a single transaction so
- * the DB is never observed in a half-applied state. Outside the transaction
- * we then: embed each new fact (Cohere), refresh affected cluster summaries
- * (LLM), and finally mark the run 'applied'. If embedding or cluster refresh
- * fails for one cluster, the others still complete — the new fact rows stay
- * canonical regardless.
+ * No fact mutations, no embeddings, no cluster summary refresh — the underlying
+ * facts are unchanged. Pre-flight checks each action's referenced facts/threads
+ * are still active. Stale references → action 'skipped' with a reason.
  *
- * Boundary: this module imports DB helpers and the LLM provider only. All web
- * / cli consumers go through src/engine/index.ts.
+ * All writes for a single applyAgentRun() happen in one transaction so the run
+ * is observable in only two states: pre-apply (all actions 'proposed') and
+ * post-apply (each action 'applied' / 'skipped' / 'rejected'; run 'applied').
  */
 
 import {
-  copyFactSourcesUnion,
+  addFactToThread,
+  createMemoryThread,
   getActiveFact,
   getAgentAction,
   getAgentRun,
-  insertAgentDerivedFact,
-  insertEmbedding,
+  getMemoryThread,
+  insertFactConnection,
   listAgentActionsForRun,
-  logProcessing,
-  markFactDeleted,
-  markFactSuperseded,
   setAgentActionApplied,
   setAgentActionRejected,
   setAgentActionSkipped,
   setAgentRunApplied,
   setAgentRunRejected,
+  type AgentActionOp,
   type AgentActionRow,
   type AgentRunRow,
+  type ConnectionPredicate,
   type DB,
 } from '../storage/db';
-import { refreshClusterSummary } from '../cluster';
+import { CONNECTION_PREDICATES } from '../storage/db';
 import type { LLMProvider } from '../../llm/provider';
 
 export interface ApplyAgentRunOptions {
@@ -56,56 +50,43 @@ export interface ApplyAgentRunResult {
   applied: number;
   skipped: number;
   rejected: number;
-  clusters_refreshed: number;
-  clusters_deleted: number;
   errors: string[];
 }
 
-interface PlannedApply {
+interface PlannedConnect {
+  kind: 'connect';
   action: AgentActionRow;
-  /** Resolved post-validation. New fact rows aren't created until inside the tx. */
-  plan:
-    | {
-        kind: 'update';
-        targetFact: { id: number; subject: string; category: string; event_ts: number | null };
-        newContent: string;
-        newCategory: string;
-        sourceFactIdsForUnion: number[];
-      }
-    | {
-        kind: 'delete';
-        targetFact: { id: number; subject: string; category: string };
-      }
-    | {
-        kind: 'merge';
-        subject: string;
-        canonicalContent: string;
-        canonicalCategory: string;
-        mergedFacts: Array<{ id: number; category: string; event_ts: number | null }>;
-        sourceFactIdsForUnion: number[];
-      };
+  fromFactId: number;
+  toFactId: number;
+  predicate: ConnectionPredicate;
 }
+interface PlannedAssignThread {
+  kind: 'assign_thread';
+  action: AgentActionRow;
+  factId: number;
+  threadId: number;
+}
+interface PlannedCreateThread {
+  kind: 'create_thread';
+  action: AgentActionRow;
+  name: string;
+  description: string | null;
+  ownerSubjectWaId: string | null;
+  attachedFactIds: number[];
+}
+type PlannedApply = PlannedConnect | PlannedAssignThread | PlannedCreateThread;
 
 interface SkipPlan {
   action: AgentActionRow;
   reason: string;
 }
 
-interface NewFactJob {
-  factId: number;
-  content: string;
-  subject: string;
-  category: string;
-}
-
-interface ClusterKey {
-  subject: string;
-  category: string;
-}
-
 export async function applyAgentRun(
   db: DB,
-  provider: LLMProvider,
+  // provider param kept for signature stability with older callers; the
+  // new-model apply path doesn't need an LLM provider (no embeddings,
+  // no cluster summarize). Accept any value, ignore it.
+  _provider: LLMProvider,
   runId: number,
   opts: ApplyAgentRunOptions
 ): Promise<ApplyAgentRunResult> {
@@ -126,90 +107,74 @@ export async function applyAgentRun(
   for (const action of proposed) {
     const result = planActionApply(db, action);
     if ('reason' in result) toSkip.push({ action, reason: result.reason });
-    else planned.push({ action, plan: result });
+    else planned.push(result);
   }
 
   const errors: string[] = [];
-  const newFactJobs: NewFactJob[] = [];
-  const affectedClusters = new Map<string, ClusterKey>();
-  const recordCluster = (subject: string, category: string) => {
-    affectedClusters.set(`${subject}|${category}`, { subject, category });
-  };
 
-  // ───── Phase 1: tx — fact mutations + per-action status updates ─────
+  // ───── Single transaction for all writes + per-action status ─────
   const writeTx = db.transaction(() => {
-    // Skip stale actions.
     for (const s of toSkip) {
       setAgentActionSkipped(db, s.action.id, s.reason);
       log(`  action ${s.action.id} SKIPPED: ${s.reason}`);
     }
 
-    // Apply planned actions.
     for (const p of planned) {
       try {
-        if (p.plan.kind === 'update') {
-          const newId = insertAgentDerivedFact(db, {
-            subject: p.plan.targetFact.subject,
-            category: p.plan.newCategory,
-            content: p.plan.newContent,
+        if (p.kind === 'connect') {
+          insertFactConnection(db, {
+            from_fact_id: p.fromFactId,
+            to_fact_id: p.toFactId,
+            predicate: p.predicate,
             confidence: p.action.confidence,
-            event_ts: p.plan.targetFact.event_ts,
+            reason: p.action.reason,
+            source_agent_action_id: p.action.id,
           });
-          copyFactSourcesUnion(db, p.plan.sourceFactIdsForUnion, newId);
-          markFactSuperseded(db, p.plan.targetFact.id, newId);
-          setAgentActionApplied(db, p.action.id, newId);
-          recordCluster(p.plan.targetFact.subject, p.plan.targetFact.category);
-          if (p.plan.newCategory !== p.plan.targetFact.category) {
-            recordCluster(p.plan.targetFact.subject, p.plan.newCategory);
-          }
-          newFactJobs.push({
-            factId: newId,
-            content: p.plan.newContent,
-            subject: p.plan.targetFact.subject,
-            category: p.plan.newCategory,
-          });
+          setAgentActionApplied(db, p.action.id, { fact_id: null, thread_id: null });
           log(
-            `  action ${p.action.id} UPDATE fact ${p.plan.targetFact.id} → ${newId}`
+            `  action ${p.action.id} CONNECT(${p.predicate}) ` +
+              `${p.fromFactId} → ${p.toFactId}`
           );
-        } else if (p.plan.kind === 'delete') {
-          markFactDeleted(db, p.plan.targetFact.id);
-          setAgentActionApplied(db, p.action.id, null);
-          recordCluster(p.plan.targetFact.subject, p.plan.targetFact.category);
-          log(`  action ${p.action.id} DELETE fact ${p.plan.targetFact.id}`);
-        } else {
-          // merge
-          const newId = insertAgentDerivedFact(db, {
-            subject: p.plan.subject,
-            category: p.plan.canonicalCategory,
-            content: p.plan.canonicalContent,
-            confidence: p.action.confidence,
-            event_ts: null,
+        } else if (p.kind === 'assign_thread') {
+          addFactToThread(db, {
+            fact_id: p.factId,
+            thread_id: p.threadId,
+            source_agent_action_id: p.action.id,
           });
-          copyFactSourcesUnion(db, p.plan.sourceFactIdsForUnion, newId);
-          for (const m of p.plan.mergedFacts) {
-            markFactSuperseded(db, m.id, newId);
-            recordCluster(p.plan.subject, m.category);
-          }
-          recordCluster(p.plan.subject, p.plan.canonicalCategory);
-          setAgentActionApplied(db, p.action.id, newId);
-          newFactJobs.push({
-            factId: newId,
-            content: p.plan.canonicalContent,
-            subject: p.plan.subject,
-            category: p.plan.canonicalCategory,
+          setAgentActionApplied(db, p.action.id, {
+            fact_id: p.factId,
+            thread_id: p.threadId,
           });
           log(
-            `  action ${p.action.id} MERGE [${p.plan.mergedFacts
-              .map((m) => m.id)
-              .join(',')}] → ${newId}`
+            `  action ${p.action.id} ASSIGN_THREAD fact ${p.factId} → thread ${p.threadId}`
+          );
+        } else {
+          // create_thread
+          const threadId = createMemoryThread(db, {
+            name: p.name,
+            description: p.description,
+            owner_subject_wa_id: p.ownerSubjectWaId,
+          });
+          for (const fid of p.attachedFactIds) {
+            addFactToThread(db, {
+              fact_id: fid,
+              thread_id: threadId,
+              source_agent_action_id: p.action.id,
+            });
+          }
+          setAgentActionApplied(db, p.action.id, { thread_id: threadId });
+          log(
+            `  action ${p.action.id} CREATE_THREAD "${p.name}" → ${threadId}` +
+              (p.attachedFactIds.length
+                ? ` (+${p.attachedFactIds.length} fact(s) attached)`
+                : '')
           );
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         errors.push(`action ${p.action.id}: ${message}`);
-        // If something throws inside the tx, the DB call will be rolled back
-        // when we re-throw below. We mark the action skipped before throwing
-        // so the audit trail records why.
+        // Rethrow to roll back the whole transaction — partial application is
+        // worse than none.
         throw err;
       }
     }
@@ -226,50 +191,10 @@ export async function applyAgentRun(
       applied: 0,
       skipped: 0,
       rejected: 0,
-      clusters_refreshed: 0,
-      clusters_deleted: 0,
       errors: [message],
     };
   }
 
-  // ───── Phase 2: embed each new fact (outside tx) ─────
-  for (const job of newFactJobs) {
-    try {
-      const r = await provider.embed(job.content, 'document');
-      insertEmbedding(db, job.factId, r.vector);
-      logProcessing(db, {
-        burst_id: null,
-        stage: 'embed',
-        model: r.usage.model,
-        tokens_in: r.usage.tokens_in,
-        tokens_out: r.usage.tokens_out,
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      errors.push(`embed fact ${job.factId}: ${message}`);
-      log(`  embed fact ${job.factId} ERROR: ${message}`);
-    }
-  }
-
-  // ───── Phase 3: refresh affected cluster summaries ─────
-  let clustersRefreshed = 0;
-  let clustersDeleted = 0;
-  for (const { subject, category } of affectedClusters.values()) {
-    try {
-      const result = await refreshClusterSummary(db, provider, subject, category, {
-        burstId: null,
-        log,
-      });
-      if (result === 'refreshed') clustersRefreshed++;
-      else if (result === 'deleted') clustersDeleted++;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      errors.push(`cluster ${subject}/${category}: ${message}`);
-      log(`  CLUSTER ${subject}/${category} refresh ERROR: ${message}`);
-    }
-  }
-
-  // ───── Phase 4: mark run applied ─────
   const finalActions = listAgentActionsForRun(db, runId);
   const appliedCount = finalActions.filter((a) => a.status === 'applied').length;
   const skippedCount = finalActions.filter((a) => a.status === 'skipped').length;
@@ -286,18 +211,11 @@ export async function applyAgentRun(
     applied: appliedCount,
     skipped: skippedCount,
     rejected: rejectedCount,
-    clusters_refreshed: clustersRefreshed,
-    clusters_deleted: clustersDeleted,
     errors,
   };
 }
 
-/**
- * Apply a single proposed action without mutating run-level status. Useful
- * for piecemeal review/approval. The caller is responsible for eventually
- * calling applyAgentRun (which will skip already-applied/-rejected actions
- * and finalize run status) or finalizing the run themselves.
- */
+/** Apply a single proposed action. Useful for piecemeal review/approval. */
 export interface ApplyAgentActionOptions {
   approvedBy: string;
   log?: (line: string) => void;
@@ -307,13 +225,12 @@ export interface ApplyAgentActionResult {
   action: AgentActionRow;
   applied: boolean;
   skipped_reason?: string;
-  new_fact_id?: number | null;
   errors: string[];
 }
 
 export async function applyAgentAction(
   db: DB,
-  provider: LLMProvider,
+  _provider: LLMProvider,
   actionId: number,
   opts: ApplyAgentActionOptions
 ): Promise<ApplyAgentActionResult> {
@@ -325,6 +242,7 @@ export async function applyAgentAction(
       `applyAgentAction: action ${actionId} is in status ${action.status}, expected 'proposed'`
     );
   }
+  void opts.approvedBy; // currently no run-level finalization here
 
   const planResult = planActionApply(db, action);
   if ('reason' in planResult) {
@@ -337,70 +255,48 @@ export async function applyAgentAction(
     };
   }
 
-  const newFactJobs: NewFactJob[] = [];
-  const affectedClusters = new Map<string, ClusterKey>();
-  const recordCluster = (subject: string, category: string) => {
-    affectedClusters.set(`${subject}|${category}`, { subject, category });
-  };
-
+  const errors: string[] = [];
   const tx = db.transaction(() => {
-    if (planResult.kind === 'update') {
-      const newId = insertAgentDerivedFact(db, {
-        subject: planResult.targetFact.subject,
-        category: planResult.newCategory,
-        content: planResult.newContent,
+    if (planResult.kind === 'connect') {
+      insertFactConnection(db, {
+        from_fact_id: planResult.fromFactId,
+        to_fact_id: planResult.toFactId,
+        predicate: planResult.predicate,
         confidence: action.confidence,
-        event_ts: planResult.targetFact.event_ts,
+        reason: action.reason,
+        source_agent_action_id: actionId,
       });
-      copyFactSourcesUnion(db, planResult.sourceFactIdsForUnion, newId);
-      markFactSuperseded(db, planResult.targetFact.id, newId);
-      setAgentActionApplied(db, actionId, newId);
-      recordCluster(planResult.targetFact.subject, planResult.targetFact.category);
-      if (planResult.newCategory !== planResult.targetFact.category) {
-        recordCluster(planResult.targetFact.subject, planResult.newCategory);
-      }
-      newFactJobs.push({
-        factId: newId,
-        content: planResult.newContent,
-        subject: planResult.targetFact.subject,
-        category: planResult.newCategory,
+      setAgentActionApplied(db, actionId, {});
+    } else if (planResult.kind === 'assign_thread') {
+      addFactToThread(db, {
+        fact_id: planResult.factId,
+        thread_id: planResult.threadId,
+        source_agent_action_id: actionId,
       });
-      return newId;
-    } else if (planResult.kind === 'delete') {
-      markFactDeleted(db, planResult.targetFact.id);
-      setAgentActionApplied(db, actionId, null);
-      recordCluster(planResult.targetFact.subject, planResult.targetFact.category);
-      return null;
+      setAgentActionApplied(db, actionId, {
+        fact_id: planResult.factId,
+        thread_id: planResult.threadId,
+      });
     } else {
-      const newId = insertAgentDerivedFact(db, {
-        subject: planResult.subject,
-        category: planResult.canonicalCategory,
-        content: planResult.canonicalContent,
-        confidence: action.confidence,
-        event_ts: null,
+      const threadId = createMemoryThread(db, {
+        name: planResult.name,
+        description: planResult.description,
+        owner_subject_wa_id: planResult.ownerSubjectWaId,
       });
-      copyFactSourcesUnion(db, planResult.sourceFactIdsForUnion, newId);
-      for (const m of planResult.mergedFacts) {
-        markFactSuperseded(db, m.id, newId);
-        recordCluster(planResult.subject, m.category);
+      for (const fid of planResult.attachedFactIds) {
+        addFactToThread(db, {
+          fact_id: fid,
+          thread_id: threadId,
+          source_agent_action_id: actionId,
+        });
       }
-      recordCluster(planResult.subject, planResult.canonicalCategory);
-      setAgentActionApplied(db, actionId, newId);
-      newFactJobs.push({
-        factId: newId,
-        content: planResult.canonicalContent,
-        subject: planResult.subject,
-        category: planResult.canonicalCategory,
-      });
-      return newId;
+      setAgentActionApplied(db, actionId, { thread_id: threadId });
     }
   });
 
-  let newFactId: number | null = null;
-  const errors: string[] = [];
   try {
-    newFactId = tx();
-    log(`  action ${actionId} APPLIED → fact ${newFactId ?? '(deleted)'}`);
+    tx();
+    log(`  action ${actionId} APPLIED (${planResult.kind})`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     errors.push(message);
@@ -411,38 +307,9 @@ export async function applyAgentAction(
     };
   }
 
-  for (const job of newFactJobs) {
-    try {
-      const r = await provider.embed(job.content, 'document');
-      insertEmbedding(db, job.factId, r.vector);
-      logProcessing(db, {
-        burst_id: null,
-        stage: 'embed',
-        model: r.usage.model,
-        tokens_in: r.usage.tokens_in,
-        tokens_out: r.usage.tokens_out,
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      errors.push(`embed fact ${job.factId}: ${message}`);
-    }
-  }
-  for (const { subject, category } of affectedClusters.values()) {
-    try {
-      await refreshClusterSummary(db, provider, subject, category, {
-        burstId: null,
-        log,
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      errors.push(`cluster ${subject}/${category}: ${message}`);
-    }
-  }
-
   return {
     action: getAgentAction(db, actionId)!,
     applied: true,
-    new_fact_id: newFactId,
     errors,
   };
 }
@@ -459,110 +326,108 @@ export function rejectAgentAction(db: DB, actionId: number, reason: string): Age
   return getAgentAction(db, actionId)!;
 }
 
-// ───────────── planning / staleness ─────────────
+// ───────────── plan / staleness ─────────────
 
-/**
- * Validate that the action's referenced facts are all still active and
- * resolve the materialized info needed for the apply transaction. Returns
- * either a typed `plan` object or `{ reason }` indicating the action must
- * be skipped.
- */
 function planActionApply(
   db: DB,
   action: AgentActionRow
-):
-  | NonNullable<PlannedApply['plan']>
-  | { reason: string } {
-  // Citing facts must still be active. If they're gone, the agent's rationale
-  // has lost its source — better to skip than to apply a now-unsourced change.
+): PlannedApply | { reason: string } {
+  // Citing facts must still be active — the agent's rationale loses its
+  // grounding otherwise.
   for (const cid of action.citing_fact_ids) {
     if (!getActiveFact(db, cid)) {
       return { reason: `citing_fact_id ${cid} is no longer active` };
     }
   }
 
-  if (action.op === 'update') {
+  if (action.op === ('connect' as AgentActionOp)) {
     if (!action.target_fact_id) {
-      return { reason: 'update action has no target_fact_id' };
+      return { reason: 'connect action has no target_fact_id (from-fact)' };
     }
-    const target = getActiveFact(db, action.target_fact_id);
-    if (!target) {
-      return { reason: `target_fact_id ${action.target_fact_id} is no longer active` };
+    const secondary = action.extra.secondary_fact_id;
+    const predicate = action.extra.predicate;
+    if (typeof secondary !== 'number' || secondary <= 0) {
+      return { reason: 'connect action extra.secondary_fact_id is missing or invalid' };
     }
-    if (!action.new_content) {
-      return { reason: 'update action has no new_content' };
+    if (
+      typeof predicate !== 'string' ||
+      !(CONNECTION_PREDICATES as readonly string[]).includes(predicate)
+    ) {
+      return {
+        reason: `connect action extra.predicate must be one of: ${CONNECTION_PREDICATES.join(', ')}`,
+      };
     }
-    const newCategory = action.new_category ?? target.category;
+    if (!getActiveFact(db, action.target_fact_id)) {
+      return { reason: `from_fact_id ${action.target_fact_id} is no longer active` };
+    }
+    if (!getActiveFact(db, secondary)) {
+      return { reason: `to_fact_id ${secondary} is no longer active` };
+    }
     return {
-      kind: 'update',
-      targetFact: {
-        id: target.id,
-        subject: target.subject_wa_id,
-        category: target.category,
-        event_ts: target.event_ts,
-      },
-      newContent: action.new_content,
-      newCategory,
-      sourceFactIdsForUnion: dedup([target.id, ...action.citing_fact_ids]),
+      kind: 'connect',
+      action,
+      fromFactId: action.target_fact_id,
+      toFactId: secondary,
+      predicate: predicate as ConnectionPredicate,
     };
   }
 
-  if (action.op === 'delete') {
+  if (action.op === ('assign_thread' as AgentActionOp)) {
     if (!action.target_fact_id) {
-      return { reason: 'delete action has no target_fact_id' };
+      return { reason: 'assign_thread action has no target_fact_id' };
     }
-    const target = getActiveFact(db, action.target_fact_id);
-    if (!target) {
-      return { reason: `target_fact_id ${action.target_fact_id} is no longer active` };
+    const threadId = action.extra.thread_id;
+    if (typeof threadId !== 'number' || threadId <= 0) {
+      return { reason: 'assign_thread action extra.thread_id is missing or invalid' };
+    }
+    if (!getActiveFact(db, action.target_fact_id)) {
+      return { reason: `fact_id ${action.target_fact_id} is no longer active` };
+    }
+    const thread = getMemoryThread(db, threadId);
+    if (!thread || thread.deleted_at !== null) {
+      return { reason: `thread_id ${threadId} not found or deleted` };
     }
     return {
-      kind: 'delete',
-      targetFact: {
-        id: target.id,
-        subject: target.subject_wa_id,
-        category: target.category,
-      },
+      kind: 'assign_thread',
+      action,
+      factId: action.target_fact_id,
+      threadId,
     };
   }
 
-  if (action.op === 'merge') {
-    if (!action.merge_fact_ids || action.merge_fact_ids.length < 2) {
-      return { reason: 'merge action has < 2 merge_fact_ids' };
+  if (action.op === ('create_thread' as AgentActionOp)) {
+    const name = action.extra.name;
+    if (typeof name !== 'string' || !name.trim()) {
+      return { reason: 'create_thread action extra.name is missing' };
     }
-    if (!action.new_content || !action.new_category) {
-      return { reason: 'merge action missing canonical content/category' };
-    }
-    const mergedFacts: Array<{ id: number; category: string; event_ts: number | null }> = [];
-    let subject: string | null = null;
-    for (const fid of action.merge_fact_ids) {
-      const f = getActiveFact(db, fid);
-      if (!f) {
-        return { reason: `merge fact ${fid} is no longer active` };
+    const description =
+      typeof action.extra.description === 'string' ? action.extra.description : null;
+    const ownerRaw = action.extra.owner_subject_wa_id;
+    const owner =
+      typeof ownerRaw === 'string'
+        ? ownerRaw
+        : ownerRaw === null || ownerRaw === undefined
+          ? null
+          : null;
+    const attached = Array.isArray(action.extra.attached_fact_ids)
+      ? (action.extra.attached_fact_ids as unknown[]).filter(
+          (v): v is number => typeof v === 'number' && v > 0
+        )
+      : [];
+    for (const fid of attached) {
+      if (!getActiveFact(db, fid)) {
+        return { reason: `attached_fact_id ${fid} is no longer active` };
       }
-      if (subject === null) subject = f.subject_wa_id;
-      else if (f.subject_wa_id !== subject) {
-        return {
-          reason: `merge fact ${fid} subject mismatch (expected ${subject}, got ${f.subject_wa_id})`,
-        };
-      }
-      mergedFacts.push({ id: f.id, category: f.category, event_ts: f.event_ts });
     }
     return {
-      kind: 'merge',
-      subject: subject!,
-      canonicalContent: action.new_content,
-      canonicalCategory: action.new_category,
-      mergedFacts,
-      sourceFactIdsForUnion: dedup([
-        ...action.merge_fact_ids,
-        ...action.citing_fact_ids,
-      ]),
+      kind: 'create_thread',
+      action,
+      name: name.trim(),
+      description,
+      ownerSubjectWaId: owner,
+      attachedFactIds: attached,
     };
   }
 
   return { reason: `unknown action op: ${action.op}` };
-}
-
-function dedup<T>(arr: T[]): T[] {
-  return Array.from(new Set(arr));
 }
