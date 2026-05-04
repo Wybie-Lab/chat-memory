@@ -9,7 +9,7 @@ import {
   processBatch,
 } from '../engine';
 import { loadWhitelist, syncWhitelistToDb } from '../sources/whatsapp/whitelist';
-import { createLLMProvider } from '../llm/claude';
+import { createLLMProvider } from '../llm';
 
 async function main() {
   const sessionPath = process.env.SESSION_PATH ?? './data/session';

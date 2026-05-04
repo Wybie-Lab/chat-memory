@@ -5,6 +5,7 @@ import {
   markBurstProcessed,
   markFactSuperseded,
   markFactDeleted,
+  deactivateGraphForFact,
   existingFactsForSubject,
   activeFactsForCluster,
   countActiveFactsForSubject,
@@ -18,6 +19,7 @@ import {
   type UnprocessedBurst,
   type ActiveFactRow,
 } from './storage/db';
+import { writeExtractedGraph, type GraphFactContext } from './graph';
 import type {
   LLMProvider,
   BurstInput,
@@ -56,6 +58,7 @@ const CLUSTER_SUMMARY_MIN_FACTS = 3;
 // for power-chats with hundreds of facts about one person.
 const CONSOLIDATION_FULL_LIST_THRESHOLD = 30;
 const CONSOLIDATION_SIMILAR_PER_CANDIDATE = 12;
+const GRAPH_ENABLED = process.env.ENABLE_GRAPH === '1';
 
 function emptyStats(scanned = 0): ProcessStats {
   return {
@@ -325,6 +328,7 @@ async function processOne(
   };
 
   const writeTx = db.transaction(() => {
+    const graphJobs: GraphFactContext[] = [];
     for (const o of ops) {
       if (o.kind === 'add') {
         const e = embedded.get(o)!;
@@ -338,6 +342,17 @@ async function processOne(
           event_ts: o.fact.event_ts ?? null,
         });
         insertEmbedding(db, factId, e.vector);
+        if (GRAPH_ENABLED) {
+          graphJobs.push({
+            fact_id: factId,
+            subject: o.subject,
+            category: o.fact.category,
+            content: o.fact.content,
+            confidence: o.fact.confidence,
+            event_ts: o.fact.event_ts ?? null,
+            source_burst_id: burst.id,
+          });
+        }
         logProcessing(db, {
           burst_id: burst.id,
           stage: 'embed',
@@ -361,6 +376,18 @@ async function processOne(
         });
         insertEmbedding(db, newId, e.vector);
         markFactSuperseded(db, o.oldId, newId);
+        deactivateGraphForFact(db, o.oldId, 'superseded');
+        if (GRAPH_ENABLED) {
+          graphJobs.push({
+            fact_id: newId,
+            subject: o.subject,
+            category: o.fact.category,
+            content: o.fact.content,
+            confidence: o.fact.confidence,
+            event_ts: o.fact.event_ts ?? null,
+            source_burst_id: burst.id,
+          });
+        }
         logProcessing(db, {
           burst_id: burst.id,
           stage: 'embed',
@@ -375,6 +402,7 @@ async function processOne(
         log(`  burst ${burst.id} UPDATE fact ${o.oldId} → ${newId} about ${o.subject}: ${o.fact.content}`);
       } else if (o.kind === 'delete') {
         markFactDeleted(db, o.oldId);
+        deactivateGraphForFact(db, o.oldId, 'deleted');
         result.deleted++;
         const old = oldFactCluster.get(o.oldId);
         if (old) recordCluster(old.subject, old.category);
@@ -386,8 +414,34 @@ async function processOne(
     }
     markBurstFiltered(db, burst.id, true);
     markBurstProcessed(db, burst.id);
+    return graphJobs;
   });
-  writeTx();
+  const graphJobs = writeTx();
+
+  if (GRAPH_ENABLED && graphJobs.length > 0) {
+    for (const job of graphJobs) {
+      try {
+        const graphResult = await provider.extractGraphFromFact(job);
+        const written = writeExtractedGraph(db, job, graphResult.graph);
+        logProcessing(db, {
+          burst_id: burst.id,
+          stage: 'graph_extract',
+          model: graphResult.usage.model,
+          tokens_in: graphResult.usage.tokens_in,
+          tokens_out: graphResult.usage.tokens_out,
+        });
+        log(
+          `  burst ${burst.id} GRAPH fact ${job.fact_id}: entities=${written.entities} mentions=${written.mentions} edges=${written.edges}`
+        );
+      } catch (err) {
+        log(
+          `  burst ${burst.id} GRAPH fact ${job.fact_id} ERROR: ${
+            err instanceof Error ? err.message : err
+          }`
+        );
+      }
+    }
+  }
 
   for (const key of affectedClusters) {
     const sep = key.indexOf(' ');

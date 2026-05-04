@@ -4,6 +4,14 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>manila</title>
+  <link rel="icon" href="data:," />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.164.1/build/three.module.js"
+      }
+    }
+  </script>
   <style>
     :root {
       --bg: #0e0e10;
@@ -391,6 +399,137 @@
       padding-top: 6px; border-top: 1px solid var(--border); font-style: italic;
     }
 
+    /* GRAPH */
+    #graph-view {
+      padding: 0; flex-direction: row; min-height: 0;
+    }
+    .graph-sidebar {
+      width: 320px; flex-shrink: 0;
+      border-right: 1px solid var(--border);
+      background: var(--panel);
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+    .graph-sidebar input {
+      margin: 12px; padding: 8px 12px;
+      border-radius: var(--radius);
+      background: var(--panel-2); border: 1px solid var(--border); color: var(--fg);
+      font: inherit;
+    }
+    .graph-sidebar input:focus { outline: none; border-color: var(--accent); }
+    .graph-stats {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
+      padding: 0 12px 12px;
+    }
+    .graph-stat {
+      background: var(--panel-2); border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px;
+    }
+    .graph-stat strong { display: block; color: var(--fg); font-size: 16px; line-height: 1; }
+    .graph-stat span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+    #graph-entities {
+      list-style: none; margin: 0; padding: 0 8px 12px;
+      overflow-y: auto; flex: 1;
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    #graph-entities li {
+      padding: 8px 12px; cursor: pointer; border-radius: 6px;
+      display: grid; grid-template-columns: 1fr auto; gap: 4px 8px;
+      align-items: center;
+    }
+    #graph-entities li:hover { background: var(--panel-2); }
+    #graph-entities li.selected {
+      background: var(--panel-2); border-left: 2px solid var(--accent);
+      padding-left: 10px;
+    }
+    .ge-name { color: var(--fg); font-weight: 500; overflow-wrap: anywhere; }
+    .ge-type {
+      color: var(--muted); font-size: 10px; text-transform: uppercase;
+      letter-spacing: 0.05em; background: var(--bg); padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .ge-meta { grid-column: 1 / -1; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+    .graph-main {
+      flex: 1; min-width: 0; overflow-y: auto; padding: 24px;
+      display: flex; flex-direction: column; gap: 16px;
+    }
+    .graph-toolbar {
+      display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
+      padding-bottom: 12px; border-bottom: 1px solid var(--border);
+    }
+    .graph-toolbar h2 { margin: 0; font-size: 22px; font-weight: 600; }
+    .graph-canvas {
+      height: 520px; min-height: 360px;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: var(--radius); overflow: hidden; position: relative;
+    }
+    .graph-canvas canvas { width: 100%; height: 100%; display: block; }
+    .graph-overlay {
+      position: absolute; left: 12px; top: 12px; z-index: 2;
+      display: flex; gap: 6px; align-items: center;
+      color: var(--muted); font-size: 11px; pointer-events: none;
+    }
+    .graph-overlay button {
+      pointer-events: auto;
+      background: rgba(31,31,36,0.9); border: 1px solid var(--border);
+      color: var(--fg); border-radius: 6px; padding: 4px 8px;
+      font: inherit; cursor: pointer;
+    }
+    .graph-overlay button:hover { border-color: var(--accent); }
+    .graph-tooltip {
+      position: absolute; z-index: 3; pointer-events: none;
+      background: rgba(14,14,16,0.95); border: 1px solid var(--border);
+      color: var(--fg); border-radius: 6px; padding: 6px 8px;
+      font-size: 11px; max-width: 220px; transform: translate(10px, 10px);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    }
+    .graph-tooltip.hidden { display: none; }
+    .graph-details {
+      display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, 0.7fr);
+      gap: 16px;
+    }
+    .graph-panel {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 14px 16px;
+    }
+    .graph-panel h3 {
+      margin: 0 0 10px; color: var(--muted); font-size: 11px;
+      text-transform: uppercase; letter-spacing: 0.05em;
+    }
+    .edge-list { display: flex; flex-direction: column; gap: 8px; }
+    .edge-item {
+      background: var(--panel-2); border: 1px solid var(--border);
+      border-radius: 6px; padding: 10px 12px;
+    }
+    .edge-line { color: var(--fg); overflow-wrap: anywhere; }
+    .edge-line .pred { color: var(--accent); font-weight: 600; margin: 0 6px; }
+    .edge-meta {
+      margin-top: 4px; color: var(--muted); font-size: 11px;
+      font-variant-numeric: tabular-nums;
+    }
+    @media (max-width: 900px) {
+      body { overflow-x: hidden; }
+      header {
+        flex-wrap: wrap; align-items: flex-start; gap: 10px 14px;
+        padding: 14px 12px;
+      }
+      header h1 { min-width: 72px; }
+      header h1 span { display: block; margin-left: 0; margin-top: 2px; }
+      nav { flex: 1; min-width: 250px; overflow-x: auto; }
+      nav button { padding: 6px 12px; white-space: nowrap; }
+      #pipeline-status {
+        order: 3; width: 100%; max-width: none; min-width: 0;
+        margin-left: 0;
+      }
+      #graph-view { flex-direction: column; }
+      .graph-sidebar { width: 100%; max-height: 260px; border-right: 0; border-bottom: 1px solid var(--border); }
+      .graph-main { padding: 24px 12px; }
+      .graph-toolbar { align-items: flex-start; }
+      .graph-details { grid-template-columns: 1fr; }
+      .graph-canvas { height: 420px; min-height: 320px; }
+      .graph-overlay { right: 12px; flex-wrap: wrap; }
+    }
+
     /* IMPORT */
     #import-view { padding: 24px; max-width: 720px; margin: 0 auto; width: 100%; }
     #import-view h2 { font-size: 18px; font-weight: 600; margin: 0 0 6px; }
@@ -455,6 +594,7 @@
     <nav>
       <button data-view="chat" class="active">Chat</button>
       <button data-view="facts">Facts</button>
+      <button data-view="graph">Graph</button>
       <button data-view="import">Import</button>
     </nav>
     <div id="pipeline-status" aria-live="polite">
@@ -489,6 +629,34 @@
       </aside>
       <div id="facts-detail">
         <!-- populated by JS based on selection -->
+      </div>
+    </section>
+
+    <section id="graph-view" class="view">
+      <aside class="graph-sidebar">
+        <input type="text" id="graph-search" placeholder="Search entities..." autocomplete="off" />
+        <div class="graph-stats">
+          <div class="graph-stat"><strong id="graph-stat-entities">0</strong><span>entities</span></div>
+          <div class="graph-stat"><strong id="graph-stat-edges">0</strong><span>edges</span></div>
+          <div class="graph-stat"><strong id="graph-stat-mentions">0</strong><span>mentions</span></div>
+        </div>
+        <ul id="graph-entities"></ul>
+      </aside>
+      <div class="graph-main">
+        <div class="graph-toolbar">
+          <h2>Knowledge graph</h2>
+        </div>
+        <div id="graph-canvas" class="graph-canvas"></div>
+        <div class="graph-details">
+          <div class="graph-panel">
+            <h3 id="graph-edge-title">Edges</h3>
+            <div id="graph-edge-list" class="edge-list"></div>
+          </div>
+          <div class="graph-panel">
+            <h3>Selected entity</h3>
+            <div id="graph-selected-detail" class="edge-list"></div>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -527,18 +695,51 @@
   </main>
 
   <script>
+    let threeReadyPromise = null;
+    let THREE_NS = null;
+    let OrbitControlsCtor = null;
+
+    function ensureThree() {
+      if (threeReadyPromise) return threeReadyPromise;
+      threeReadyPromise = Promise.all([
+        import('https://unpkg.com/three@0.164.1/build/three.module.js'),
+        import('https://unpkg.com/three@0.164.1/examples/jsm/controls/OrbitControls.js'),
+      ]).then(([three, controls]) => {
+        THREE_NS = three;
+        OrbitControlsCtor = controls.OrbitControls;
+      });
+      return threeReadyPromise;
+    }
+
     const $ = (sel) => document.querySelector(sel);
     const $$ = (sel) => document.querySelectorAll(sel);
 
     // ---- view switching ----
+    const knownViews = new Set(['chat', 'facts', 'graph', 'import']);
+
+    function viewFromHash() {
+      const view = window.location.hash.replace(/^#/, '');
+      return knownViews.has(view) ? view : 'chat';
+    }
+
+    function activateView(view, updateHash = true) {
+      const btn = $(`nav button[data-view="${view}"]`);
+      if (!btn) return;
+      $$('nav button').forEach((b) => b.classList.toggle('active', b === btn));
+      $$('.view').forEach((v) => v.classList.toggle('active', v.id === view + '-view'));
+      if (view !== 'graph') disposeGraphScene();
+      if (view === 'facts') loadSubjects();
+      if (view === 'graph') loadGraph();
+      if (view === 'import') loadWhitelistOptions();
+      if (updateHash && window.location.hash !== `#${view}`) {
+        history.replaceState(null, '', `#${view}`);
+      }
+    }
+
     $$('nav button').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        $$('nav button').forEach((b) => b.classList.toggle('active', b === btn));
-        $$('.view').forEach((v) => v.classList.toggle('active', v.id === btn.dataset.view + '-view'));
-        if (btn.dataset.view === 'facts') loadSubjects();
-        if (btn.dataset.view === 'import') loadWhitelistOptions();
-      });
+      btn.addEventListener('click', () => activateView(btn.dataset.view));
     });
+    window.addEventListener('hashchange', () => activateView(viewFromHash(), false));
 
     // ---- chat ----
     const messagesEl = $('#messages');
@@ -1206,6 +1407,432 @@
       })[c]);
     }
 
+    // ---- knowledge graph ----
+    const graphSearchEl = $('#graph-search');
+    const graphEntitiesEl = $('#graph-entities');
+    const graphCanvasEl = $('#graph-canvas');
+    const graphEdgeListEl = $('#graph-edge-list');
+    const graphEdgeTitleEl = $('#graph-edge-title');
+    const graphSelectedDetailEl = $('#graph-selected-detail');
+    const graphStatEntitiesEl = $('#graph-stat-entities');
+    const graphStatEdgesEl = $('#graph-stat-edges');
+    const graphStatMentionsEl = $('#graph-stat-mentions');
+
+    let graphData = null;
+    let selectedGraphEntityId = null;
+    let graphSceneState = null;
+
+    graphSearchEl.addEventListener('input', () => {
+      renderGraphEntityList();
+      renderGraph();
+    });
+
+    async function loadGraph() {
+      graphCanvasEl.innerHTML = '<div class="empty"><h2>Loading graph…</h2></div>';
+      try {
+        const r = await fetch('/api/graph');
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'request failed');
+        graphData = data;
+        graphStatEntitiesEl.textContent = data.counts.entities;
+        graphStatEdgesEl.textContent = data.counts.edges;
+        graphStatMentionsEl.textContent = data.counts.mentions;
+        if (!selectedGraphEntityId && data.entities.length) selectedGraphEntityId = data.entities[0].id;
+        renderGraphEntityList();
+        renderGraph();
+      } catch (err) {
+        graphCanvasEl.innerHTML = `<div class="empty"><h2>Error</h2><p>${escapeHtml(err.message)}</p></div>`;
+      }
+    }
+
+    function renderGraphEntityList() {
+      if (!graphData) return;
+      const q = graphSearchEl.value.trim().toLowerCase();
+      graphEntitiesEl.innerHTML = '';
+      const entities = filteredGraphEntities();
+      if (!entities.length) {
+        graphEntitiesEl.innerHTML = '<li><span class="ge-name">No entities</span></li>';
+        return;
+      }
+      for (const e of entities) {
+        const li = document.createElement('li');
+        if (selectedGraphEntityId === e.id) li.classList.add('selected');
+        li.innerHTML = `
+          <span class="ge-name"></span>
+          <span class="ge-type"></span>
+          <span class="ge-meta"></span>
+        `;
+        li.querySelector('.ge-name').textContent = e.display_name;
+        li.querySelector('.ge-type').textContent = e.entity_type;
+        li.querySelector('.ge-meta').textContent =
+          `${e.outgoing_edge_count} out · ${e.incoming_edge_count} in · ${Math.round(e.confidence * 100)}%`;
+        li.addEventListener('click', () => {
+          selectedGraphEntityId = e.id;
+          renderGraphEntityList();
+          renderGraph();
+        });
+        graphEntitiesEl.appendChild(li);
+      }
+    }
+
+    function filteredGraphEntities() {
+      if (!graphData) return [];
+      const q = graphSearchEl.value.trim().toLowerCase();
+      if (!q) return graphData.entities;
+      return graphData.entities.filter((e) =>
+        e.display_name.toLowerCase().includes(q) ||
+        e.entity_type.toLowerCase().includes(q) ||
+        e.canonical_key.toLowerCase().includes(q)
+      );
+    }
+
+    async function renderGraph() {
+      if (!graphData) return;
+      await ensureThree();
+      const visibleEntities = filteredGraphEntities().slice(0, 80);
+      const visibleIds = new Set(visibleEntities.map((e) => e.id));
+      const selected = graphData.entities.find((e) => e.id === selectedGraphEntityId) || visibleEntities[0] || null;
+      if (!selected && visibleEntities.length === 0) {
+        graphCanvasEl.innerHTML = '<div class="empty"><h2>No graph rows yet</h2><p>Run processing with ENABLE_GRAPH=1 or rebuild the graph.</p></div>';
+        graphEdgeListEl.innerHTML = '';
+        graphSelectedDetailEl.innerHTML = '';
+        return;
+      }
+      if (selected && !visibleIds.has(selected.id)) visibleIds.add(selected.id);
+
+      const focusEdges = selected
+        ? graphData.edges.filter((edge) => edge.source_entity_id === selected.id || edge.target_entity_id === selected.id)
+        : [];
+      for (const edge of focusEdges) {
+        visibleIds.add(edge.source_entity_id);
+        visibleIds.add(edge.target_entity_id);
+      }
+
+      const entities = graphData.entities.filter((e) => visibleIds.has(e.id)).slice(0, 100);
+      const ids = new Set(entities.map((e) => e.id));
+      const edges = graphData.edges.filter((edge) => ids.has(edge.source_entity_id) && ids.has(edge.target_entity_id));
+
+      renderGraph3d(entities, edges, selected?.id ?? null);
+      renderGraphEdges(selected, focusEdges.length ? focusEdges : edges.slice(0, 80));
+      renderGraphSelected(selected, focusEdges);
+    }
+
+    function renderGraph3d(entities, edges, selectedId) {
+      const THREE = THREE_NS;
+      disposeGraphScene();
+      graphCanvasEl.innerHTML = `
+        <div class="graph-overlay">
+          <button type="button" id="graph-reset-camera" title="Reset view">Reset view</button>
+        </div>
+        <div id="graph-tooltip" class="graph-tooltip hidden"></div>
+      `;
+      const width = graphCanvasEl.clientWidth || 900;
+      const height = graphCanvasEl.clientHeight || 520;
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x17171a);
+
+      const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 3000);
+      camera.position.set(0, 80, 230);
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, preserveDrawingBuffer: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.setSize(width, height);
+      graphCanvasEl.appendChild(renderer.domElement);
+
+      const controls = new OrbitControlsCtor(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.08;
+      controls.minDistance = 40;
+      controls.maxDistance = 800;
+
+      scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+      const light = new THREE.DirectionalLight(0xffffff, 1.2);
+      light.position.set(120, 160, 200);
+      scene.add(light);
+
+      const focusIds = new Set();
+      if (selectedId) focusIds.add(selectedId);
+      for (const edge of edges) {
+        if (edge.source_entity_id === selectedId || edge.target_entity_id === selectedId) {
+          focusIds.add(edge.source_entity_id);
+          focusIds.add(edge.target_entity_id);
+        }
+      }
+      const labelLimit = width < 520 ? 8 : 24;
+      const labelIds = new Set(
+        [...entities]
+          .sort((a, b) => {
+            const aDegree = (a.outgoing_edge_count || 0) + (a.incoming_edge_count || 0);
+            const bDegree = (b.outgoing_edge_count || 0) + (b.incoming_edge_count || 0);
+            const aRank = (a.id === selectedId ? 1000 : 0) + (focusIds.has(a.id) ? 100 : 0) + aDegree;
+            const bRank = (b.id === selectedId ? 1000 : 0) + (focusIds.has(b.id) ? 100 : 0) + bDegree;
+            return bRank - aRank;
+          })
+          .slice(0, labelLimit)
+          .map((e) => e.id)
+      );
+
+      const positions = computeGraph3dPositions(entities, edges, selectedId);
+      const nodeMeshes = [];
+      const nodeById = new Map();
+      for (const e of entities) {
+        const degree = (e.outgoing_edge_count || 0) + (e.incoming_edge_count || 0);
+        const radius = e.id === selectedId ? 7 : Math.min(6, 3.5 + degree * 0.55);
+        const dim = selectedId && !focusIds.has(e.id);
+        const material = new THREE.MeshStandardMaterial({
+          color: graphColorNumber(e.entity_type),
+          roughness: 0.45,
+          metalness: 0.08,
+          transparent: true,
+          opacity: dim ? 0.25 : 0.95,
+        });
+        const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 24, 16), material);
+        const p = positions.get(e.id);
+        mesh.position.set(p.x, p.y, p.z);
+        mesh.userData.entity = e;
+        scene.add(mesh);
+        nodeMeshes.push(mesh);
+        nodeById.set(e.id, mesh);
+
+        if (!labelIds.has(e.id)) continue;
+        const label = makeTextSprite(shortLabel(e.display_name, 22), dim ? '#8a8a92' : '#e6e6ea');
+        label.position.set(p.x + radius + 2, p.y + radius + 1, p.z);
+        label.userData.entity = e;
+        scene.add(label);
+      }
+
+      const edgeMaterial = new THREE.LineBasicMaterial({
+        color: 0x4a4a54,
+        transparent: true,
+        opacity: 0.42,
+      });
+      const focusEdgeMaterial = new THREE.LineBasicMaterial({
+        color: 0x6ad0aa,
+        transparent: true,
+        opacity: 0.9,
+      });
+      for (const edge of edges) {
+        const a = positions.get(edge.source_entity_id);
+        const b = positions.get(edge.target_entity_id);
+        if (!a || !b) continue;
+        const focus = selectedId && (edge.source_entity_id === selectedId || edge.target_entity_id === selectedId);
+        const line = new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(a.x, a.y, a.z),
+            new THREE.Vector3(b.x, b.y, b.z),
+          ]),
+          focus ? focusEdgeMaterial : edgeMaterial
+        );
+        if (selectedId && !focus) line.material.opacity = 0.14;
+        scene.add(line);
+      }
+
+      const raycaster = new THREE.Raycaster();
+      const pointer = new THREE.Vector2();
+      const tooltip = $('#graph-tooltip');
+
+      function pick(event) {
+        const rect = renderer.domElement.getBoundingClientRect();
+        pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+        raycaster.setFromCamera(pointer, camera);
+        return raycaster.intersectObjects(nodeMeshes, false)[0]?.object || null;
+      }
+
+      renderer.domElement.addEventListener('pointermove', (event) => {
+        const hit = pick(event);
+        renderer.domElement.style.cursor = hit ? 'pointer' : 'grab';
+        if (!hit) {
+          tooltip.classList.add('hidden');
+          return;
+        }
+        const e = hit.userData.entity;
+        tooltip.classList.remove('hidden');
+        tooltip.style.left = `${event.offsetX}px`;
+        tooltip.style.top = `${event.offsetY}px`;
+        tooltip.textContent = `${e.display_name} · ${e.entity_type}`;
+      });
+      renderer.domElement.addEventListener('pointerleave', () => {
+        tooltip.classList.add('hidden');
+      });
+      renderer.domElement.addEventListener('click', (event) => {
+        const hit = pick(event);
+        if (!hit) return;
+        selectedGraphEntityId = hit.userData.entity.id;
+        renderGraphEntityList();
+        renderGraph();
+      });
+
+      $('#graph-reset-camera').addEventListener('click', () => {
+        camera.position.set(0, 80, 230);
+        controls.target.set(0, 0, 0);
+        controls.update();
+      });
+
+      const resize = () => {
+        const w = graphCanvasEl.clientWidth || 900;
+        const h = graphCanvasEl.clientHeight || 520;
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+        renderer.setSize(w, h);
+      };
+      window.addEventListener('resize', resize);
+
+      let stopped = false;
+      function animate() {
+        if (stopped) return;
+        controls.update();
+        renderer.render(scene, camera);
+        requestAnimationFrame(animate);
+      }
+      animate();
+
+      graphSceneState = { scene, renderer, controls, resize, stop: () => { stopped = true; } };
+      if (selectedId && nodeById.has(selectedId)) {
+        controls.target.copy(nodeById.get(selectedId).position);
+      }
+    }
+
+    function disposeGraphScene() {
+      if (!graphSceneState) return;
+      graphSceneState.stop();
+      window.removeEventListener('resize', graphSceneState.resize);
+      graphSceneState.scene.traverse((obj) => {
+        if (obj.geometry) obj.geometry.dispose();
+        if (obj.material) {
+          if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
+          else obj.material.dispose();
+        }
+        if (obj.texture) obj.texture.dispose();
+      });
+      graphSceneState.renderer.dispose();
+      graphSceneState = null;
+    }
+
+    function computeGraph3dPositions(entities, edges, selectedId) {
+      const positions = new Map();
+      const selected = entities.find((e) => e.id === selectedId);
+      if (selected) positions.set(selected.id, { x: 0, y: 0, z: 0 });
+      const neighbors = new Set();
+      for (const edge of edges) {
+        if (edge.source_entity_id === selectedId) neighbors.add(edge.target_entity_id);
+        if (edge.target_entity_id === selectedId) neighbors.add(edge.source_entity_id);
+      }
+      const rest = entities.filter((e) => !positions.has(e.id));
+      const neighborList = rest.filter((e) => neighbors.has(e.id));
+      const otherList = rest.filter((e) => !neighbors.has(e.id));
+      placeOnSphere(positions, neighborList, 60, 0.4);
+      placeOnSphere(positions, otherList, 125, 1.7);
+      if (!selected) placeOnSphere(positions, entities, 110, 0.8);
+      return positions;
+    }
+
+    function placeOnSphere(positions, entities, radius, phase) {
+      const n = Math.max(entities.length, 1);
+      const golden = Math.PI * (3 - Math.sqrt(5));
+      entities.forEach((e, i) => {
+        const y = 1 - (i / Math.max(n - 1, 1)) * 2;
+        const r = Math.sqrt(Math.max(0, 1 - y * y));
+        const theta = golden * i + phase;
+        positions.set(e.id, {
+          x: Math.cos(theta) * r * radius,
+          y: y * radius * 0.72,
+          z: Math.sin(theta) * r * radius,
+        });
+      });
+    }
+
+    function makeTextSprite(text, color) {
+      const THREE = THREE_NS;
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      const fontSize = 28;
+      ctx.font = `${fontSize}px -apple-system, system-ui, sans-serif`;
+      const metrics = ctx.measureText(text);
+      canvas.width = Math.ceil(metrics.width + 24);
+      canvas.height = 48;
+      ctx.font = `${fontSize}px -apple-system, system-ui, sans-serif`;
+      ctx.fillStyle = 'rgba(14,14,16,0.75)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = color;
+      ctx.fillText(text, 12, 32);
+      const texture = new THREE.CanvasTexture(canvas);
+      const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.set(canvas.width / 5.5, canvas.height / 5.5, 1);
+      sprite.texture = texture;
+      return sprite;
+    }
+
+    function renderGraphEdges(selected, edges) {
+      graphEdgeTitleEl.textContent = selected
+        ? `Edges connected to ${selected.display_name}`
+        : 'Edges';
+      graphEdgeListEl.innerHTML = '';
+      if (!edges.length) {
+        graphEdgeListEl.innerHTML = '<div class="empty"><p>No edges in this view.</p></div>';
+        return;
+      }
+      for (const edge of edges.slice(0, 80)) {
+        graphEdgeListEl.appendChild(renderEdgeItem(edge));
+      }
+    }
+
+    function renderGraphSelected(entity, edges) {
+      graphSelectedDetailEl.innerHTML = '';
+      if (!entity) {
+        graphSelectedDetailEl.innerHTML = '<div class="empty"><p>No entity selected.</p></div>';
+        return;
+      }
+      const item = document.createElement('div');
+      item.className = 'edge-item';
+      item.innerHTML = `
+        <div class="edge-line"><strong></strong></div>
+        <div class="edge-meta"></div>
+      `;
+      item.querySelector('strong').textContent = entity.display_name;
+      item.querySelector('.edge-meta').textContent =
+        `${entity.entity_type} · ${entity.canonical_key} · ${edges.length} connected edge${edges.length === 1 ? '' : 's'}`;
+      graphSelectedDetailEl.appendChild(item);
+      for (const edge of edges.slice(0, 12)) graphSelectedDetailEl.appendChild(renderEdgeItem(edge));
+    }
+
+    function renderEdgeItem(edge) {
+      const item = document.createElement('div');
+      item.className = 'edge-item';
+      item.innerHTML = `
+        <div class="edge-line"><span class="src"></span><span class="pred"></span><span class="tgt"></span></div>
+        <div class="edge-meta"></div>
+      `;
+      item.querySelector('.src').textContent = edge.source_display_name;
+      item.querySelector('.pred').textContent = `→ ${edge.predicate} →`;
+      item.querySelector('.tgt').textContent = edge.target_display_name;
+      item.querySelector('.edge-meta').textContent =
+        `${Math.round(edge.confidence * 100)}% · ${edge.source_fact_id ? `[fact:${edge.source_fact_id}]` : 'no fact'} · ${edge.source_entity_type} → ${edge.target_entity_type}`;
+      return item;
+    }
+
+    function graphColor(type) {
+      return ({
+        person: '#6ad0aa',
+        place: '#4a90e2',
+        organization: '#f0a832',
+        event: '#c084fc',
+        preference_topic: '#e26a6a',
+        object: '#9aa0aa',
+        concept: '#7aa2f7',
+        date: '#b8b86a',
+      })[type] || '#8a8a92';
+    }
+
+    function graphColorNumber(type) {
+      return Number('0x' + graphColor(type).slice(1));
+    }
+
+    function shortLabel(value, max) {
+      return value.length > max ? value.slice(0, max - 1) + '…' : value;
+    }
+
     // ---- import ----
     const importForm = $('#import-form');
     const importFile = $('#import-file');
@@ -1380,9 +2007,10 @@
 
     loadPipelineStatus();
     psPollTimer = setInterval(loadPipelineStatus, 3000);
+    activateView(viewFromHash(), false);
 
     // initial focus
-    input.focus();
+    if ($('#chat-view').classList.contains('active')) input.focus();
   </script>
 </body>
 </html>

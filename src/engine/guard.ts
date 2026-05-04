@@ -2,7 +2,7 @@ import type { ExtractedFact } from '../llm/provider';
 
 /**
  * Programmatic guard against the "fabricated meta-fact" failure mode where the
- * extractor describes someone it can't actually identify. Sonnet (and similar
+ * extractor describes someone it can't actually identify. LLMs sometimes
  * models) leak this through specific phrases — "a third person", "unnamed",
  * untranslated foreign pronouns in parens — when forced to substitute a
  * descriptor for a real name. Treating those phrases as drop-signals is more
@@ -17,7 +17,7 @@ const UNRESOLVED_SUBJECT_MARKERS: Array<{ re: RegExp; label: string }> = [
   { re: /\bunknown\s+(person|individual|man|woman|guy|girl)\b/i, label: '"unknown person"' },
   { re: /\b(an?\s+)?other\s+person\b/i, label: '"other person"' },
   { re: /\bsomeone\s+(else|unspecified)\b/i, label: '"someone else/unspecified"' },
-  // Quoted foreign pronoun in parens with optional English gloss — Sonnet's
+  // Quoted foreign pronoun in parens with optional English gloss — a common
   // tell that it preserved the original ambiguity instead of resolving it.
   { re: /\(\s*['"]?(lei|lui|loro|ella|él|ellos|ellas)['"]?/i, label: 'quoted foreign pronoun' },
 ];

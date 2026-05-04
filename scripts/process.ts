@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { openDb, processUntilDrained } from '../src/engine';
-import { createLLMProvider } from '../src/llm/claude';
+import { createLLMProvider } from '../src/llm';
 
 async function main() {
   const dbPath = process.env.DB_PATH ?? './data/memory.db';

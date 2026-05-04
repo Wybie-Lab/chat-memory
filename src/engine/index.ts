@@ -30,6 +30,14 @@ export {
 // ───────────── pipeline (consumers drain bursts) ─────────────
 export { processBatch, processUntilDrained } from './pipeline';
 
+// ───────────── knowledge graph (derived projection over facts) ─────────────
+export {
+  writeExtractedGraph,
+  canonicalKeyForEntity,
+  type GraphFactContext,
+  type GraphWriteResult,
+} from './graph';
+
 // ───────────── retrieval (consumers compose memory for a query) ─────────────
 export { composeMemoryBlock } from './retrieval/memory-block';
 export {
@@ -68,6 +76,19 @@ export {
   markFactDeleted,
   upsertClusterSummary,
   deleteClusterSummary,
+  clearGraphTables,
+  listActiveFactsForGraph,
+  upsertEntity,
+  insertFactEntityMention,
+  upsertKnowledgeEdge,
+  attachEdgeSource,
+  deactivateGraphForFact,
+  graphCounts,
+  searchEntities,
+  graphNeighborhood,
+  listGraphEntitiesWithStats,
+  listKnowledgeEdges,
+  graphForFact,
   logProcessing,
   listUnprocessedBursts,
   getBurstMessages,
@@ -87,6 +108,15 @@ export type {
   FactListFilters,
   ActiveFactRow,
   ClusterSummaryRow,
+  GraphEntityInput,
+  GraphEntityRow,
+  FactEntityMentionInput,
+  FactEntityMentionRow,
+  KnowledgeEdgeInput,
+  KnowledgeEdgeRow,
+  GraphFactRow,
+  GraphBuildStats,
+  GraphEntityWithStatsRow,
   SubjectInfo,
   SupersededFactRow,
   UnprocessedBurst,

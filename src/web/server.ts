@@ -12,8 +12,14 @@ import {
   factsAboutSubjectWithSource,
   supersededFactsForSubject,
   listClusterSummariesForSubject,
+  searchEntities,
+  graphNeighborhood,
+  graphCounts,
+  listGraphEntitiesWithStats,
+  listKnowledgeEdges,
+  graphForFact,
 } from '../engine';
-import { createLLMProvider } from '../llm/claude';
+import { createLLMProvider } from '../llm';
 import {
   loadWhitelist,
   syncWhitelistToDb,
@@ -54,6 +60,18 @@ app.get('/api/facts', (req: Request, res: Response) => {
     const facts = listFacts(db, { subject, category, contains: q }, limit);
     const categories = listCategories(db);
     res.json({ facts, categories });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/facts/:id/graph', (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const factId = Number(req.params.id);
+    if (!Number.isInteger(factId) || factId <= 0) {
+      return res.status(400).json({ error: 'fact id must be a positive integer' });
+    }
+    res.json(graphForFact(db, factId));
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -109,6 +127,44 @@ app.get('/api/subjects/:wa_id', (req: Request<{ wa_id: string }>, res: Response)
       facts: factsAboutSubjectWithSource(db, waId),
       superseded: supersededFactsForSubject(db, waId),
     });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/graph/search', (req: Request, res: Response) => {
+  try {
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const limit = req.query.limit ? Math.min(Number(req.query.limit), 100) : 20;
+    if (!q) return res.status(400).json({ error: 'q is required' });
+    res.json({ entities: searchEntities(db, q, limit) });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/graph', (req: Request, res: Response) => {
+  try {
+    const entityLimit = req.query.entity_limit ? Math.min(Number(req.query.entity_limit), 1000) : 500;
+    const edgeLimit = req.query.edge_limit ? Math.min(Number(req.query.edge_limit), 2000) : 1000;
+    res.json({
+      counts: graphCounts(db),
+      entities: listGraphEntitiesWithStats(db, entityLimit),
+      edges: listKnowledgeEdges(db, edgeLimit),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/graph/entity/:id', (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const entityId = Number(req.params.id);
+    if (!Number.isInteger(entityId) || entityId <= 0) {
+      return res.status(400).json({ error: 'entity id must be a positive integer' });
+    }
+    const limit = req.query.limit ? Math.min(Number(req.query.limit), 200) : 100;
+    res.json({ edges: graphNeighborhood(db, entityId, { limit }) });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }

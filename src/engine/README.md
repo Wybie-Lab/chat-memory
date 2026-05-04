@@ -41,11 +41,11 @@ This document is the canonical reference for how the engine works. It's anchored
                        │ processBatch
                        ▼
         ┌──────────────────────────────┐
-        │ filter (Haiku 4.5)           │  keep or drop the whole burst
+        │ filter (LLM provider)        │  keep or drop the whole burst
         └──────────────┬───────────────┘
                        ▼
         ┌──────────────────────────────┐
-        │ extract (Sonnet 4.6)         │  ExtractedFact[]
+        │ extract (LLM provider)       │  ExtractedFact[]
         └──────────────┬───────────────┘
                        ▼
         ┌──────────────────────────────┐
@@ -54,7 +54,7 @@ This document is the canonical reference for how the engine works. It's anchored
                        │ group by normalized subject
                        ▼
         ┌──────────────────────────────┐
-        │ consolidate (Sonnet 4.6)     │  ADD / UPDATE / DELETE / DROP
+        │ consolidate (LLM provider)   │  ADD / UPDATE / DELETE / DROP
         │   per-subject merge logic    │  vs. the existing facts for
         └──────────────┬───────────────┘  that subject
                        ▼
@@ -69,10 +69,14 @@ This document is the canonical reference for how the engine works. It's anchored
         └──────────────┬───────────────┘
                        ▼
         ┌──────────────────────────────┐
-        │ summarize (Sonnet 4.6)       │  per (subject, category)
+        │ summarize (LLM provider)     │  per (subject, category)
         └──────────────┬───────────────┘  rolled-up prose summary
                        ▼
                  cluster_summaries
+                       │
+                       │ optional rebuild-graph
+                       ▼
+                 entities / fact_entity_mentions / knowledge_edges
                        │
                        │ engine.composeMemoryBlock
                        ▼
@@ -192,6 +196,31 @@ cluster_summaries (
 
 Only built once a cluster has ≥ `CLUSTER_SUMMARY_MIN_FACTS` (3, `pipeline.ts:51`).
 
+### Knowledge graph tables
+
+The graph is a derived projection over active facts. Facts remain the canonical
+truth; graph rows can be cleared and rebuilt from `facts` with:
+
+```bash
+npm run rebuild-graph -- --limit 20 --dry-run
+npm run rebuild-graph -- --force
+```
+
+The core graph tables:
+
+```sql
+entities                 -- people, places, organizations, events, topics
+fact_entity_mentions     -- which entities a fact mentions, with roles
+knowledge_edges          -- typed entity -> entity relationships
+edge_sources             -- supporting facts/bursts for each edge
+```
+
+Graph extraction runs on already-consolidated facts, not raw chat bursts. This
+keeps the graph grounded and rebuildable while the normal fact pipeline stays
+the source of truth. Normal processing only writes graph rows when
+`ENABLE_GRAPH=1`; otherwise use `npm run rebuild-graph` to backfill or inspect
+the projection.
+
 ### `processing_log`
 
 Per-LLM-call accounting. One row per filter / extract / consolidate / embed / summarize call. Used by tools and budgets.
@@ -213,21 +242,21 @@ It pulls up to N unsettled bursts (where `end_ts <= now - BURST_GAP_SECONDS`), p
 
 For each burst, in order:
 
-### 4.1 Filter (Haiku 4.5)
+### 4.1 Filter
 
 `provider.filterBurst(burstInput) → { keep: bool, reason: string }`.
 
 Sees the full burst. Decides whether *anything* in it is worth remembering long-term. Bias is toward KEEP — false positives are easier to clean later than false negatives are to recover. Drop reasons are typically pure greetings, ephemeral logistics, or generic small talk.
 
-If `keep === false`, the burst is marked processed and the pipeline skips to the next one. Cost: one Haiku call per burst (cheap, ~$0.001).
+If `keep === false`, the burst is marked processed and the pipeline skips to the next one.
 
-### 4.2 Extract (Sonnet 4.6)
+### 4.2 Extract
 
 `provider.extractBurst(burstInput) → { facts: ExtractedFact[] }`.
 
 Sees the full burst with each line labeled by sender. Returns atomic facts, each with `subject` / `category` / `content` / `confidence`.
 
-The prompt enforces strict subject attribution rules to prevent the most common failure mode: extracting facts about an *unnamed third person* (e.g., "she's flying to Tokyo" when "she" has no antecedent in this burst). The rule is to drop those facts entirely rather than fabricate a meta-fact like "the contact mentioned someone is flying to Tokyo." See `src/llm/claude.ts:60` for the full prompt.
+The prompt enforces strict subject attribution rules to prevent the most common failure mode: extracting facts about an *unnamed third person* (e.g., "she's flying to Tokyo" when "she" has no antecedent in this burst). The rule is to drop those facts entirely rather than fabricate a meta-fact like "the contact mentioned someone is flying to Tokyo." See `src/llm/openrouter.ts` for the full prompt.
 
 ### 4.3 Guard (programmatic)
 
@@ -235,7 +264,7 @@ The prompt enforces strict subject attribution rules to prevent the most common 
 
 Regex sentinel against the unnamed-third-person failure mode. Even with the strict prompt above, models sometimes produce `"unnamed person"`, `"a third person"`, or quoted foreign pronouns. We drop those rows hard. Programmatic, free, deterministic.
 
-### 4.4 Consolidate (Sonnet 4.6)
+### 4.4 Consolidate
 
 For each candidate fact, decide vs. existing memory: `ADD` / `UPDATE` / `DELETE` / `DROP`.
 
@@ -251,7 +280,7 @@ The four ops:
 - `DELETE` — existing fact is now wrong/obsolete; candidate provides no replacement. Soft-delete old.
 - `DROP` — candidate is fully redundant; ignore it.
 
-Validation in `validateOp` (`claude.ts:536`) rejects malformed responses (missing required fields, bad indices) — better to silently drop one op than fail the whole burst.
+Validation in `validateOp` rejects malformed responses (missing required fields, bad indices) — better to silently drop one op than fail the whole burst.
 
 ### 4.5 Embed (Cohere)
 
@@ -268,7 +297,7 @@ All ops for a burst commit atomically (`pipeline.ts:327-388`):
 
 Then `markBurstFiltered + markBurstProcessed` close the burst out.
 
-### 4.7 Summarize affected clusters (Sonnet 4.6)
+### 4.7 Summarize affected clusters
 
 For every `(subject, category)` pair touched by an op, refresh its cluster summary. If the active count drops below 3, the summary is deleted. Otherwise we re-run the summarizer with all current active facts and `upsertClusterSummary`.
 
@@ -404,20 +433,20 @@ Imported chat exports cover up to a known timestamp. The contact's `live_cutoff_
 - `markBurstProcessed` flips a flag; reprocessing a burst requires `scripts/reset-pipeline.ts` (which clears facts/embeddings/log and rebuilds bursts).
 - Cluster summaries `ON CONFLICT DO UPDATE` so refresh is idempotent.
 
-### Cost shape
+### Call shape
 
 Per burst, in expectation:
 
-| Stage | Model | Frequency | Notes |
+| Stage | Provider | Frequency | Notes |
 |---|---|---|---|
-| filter | Haiku 4.5 | 1× per burst | cheap |
-| extract | Sonnet 4.6 | 1× per kept burst | ~70% of bursts kept |
-| consolidate | Sonnet 4.6 | 1× per (kept burst × subject) | typically 1–3 subjects per burst |
+| filter | OpenRouter via AI SDK | 1× per burst | structured object generation |
+| extract | OpenRouter via AI SDK | 1× per kept burst | ~70% of bursts kept |
+| consolidate | OpenRouter via AI SDK | 1× per (kept burst × subject) | typically 1–3 subjects per burst |
 | embed | Cohere | 1× per ADD / UPDATE | reused across consolidate + persist |
-| summarize | Sonnet 4.6 | 1× per affected cluster per burst | clusters with <3 facts skipped |
-| chat (read) | Sonnet 4.6 | 1× per user question | + 1 Cohere embed for query |
+| summarize | OpenRouter via AI SDK | 1× per affected cluster per burst | clusters with <3 facts skipped |
+| chat (read) | OpenRouter via AI SDK | 1× per user question | + 1 Cohere embed for query |
 
-Filter dominates volume; Sonnet stages dominate cost.
+Filter dominates volume. OpenRouter model choice controls cost/latency/quality.
 
 ---
 
@@ -425,7 +454,7 @@ Filter dominates volume; Sonnet stages dominate cost.
 
 - `src/engine/storage/schema.sql` — full DDL.
 - `src/engine/pipeline.ts` — the orchestrator.
-- `src/llm/claude.ts` — all LLM prompts (filter, extract, consolidate, summarize, chat).
+- `src/llm/openrouter.ts` — all LLM prompts and AI SDK/OpenRouter transport.
 - `src/engine/retrieval/score.ts` — hybrid scoring weights and rationale.
 - `src/engine/retrieval/memory-block.ts` — section budgets and assembly.
 - `README.md` (repo root) — user-facing setup + usage.

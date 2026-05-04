@@ -111,3 +111,73 @@ CREATE TABLE IF NOT EXISTS cluster_summaries (
 );
 
 CREATE INDEX IF NOT EXISTS idx_cluster_subject ON cluster_summaries(subject_wa_id);
+
+-- Source-backed knowledge graph projection. Facts remain the canonical truth;
+-- these rows are rebuildable from active facts and improve connected retrieval.
+CREATE TABLE IF NOT EXISTS entities (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity_type     TEXT NOT NULL,
+  canonical_key   TEXT NOT NULL UNIQUE,
+  display_name    TEXT NOT NULL,
+  aliases_json    TEXT NOT NULL DEFAULT '[]',
+  confidence      REAL NOT NULL DEFAULT 1.0,
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL,
+  merged_into_id  INTEGER REFERENCES entities(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
+CREATE INDEX IF NOT EXISTS idx_entities_display ON entities(display_name);
+
+CREATE TABLE IF NOT EXISTS fact_entity_mentions (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  fact_id       INTEGER NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+  entity_id     INTEGER NOT NULL REFERENCES entities(id),
+  role          TEXT NOT NULL,
+  mention_text  TEXT,
+  confidence    REAL NOT NULL DEFAULT 1.0,
+  created_at    INTEGER NOT NULL,
+  UNIQUE(fact_id, entity_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mentions_fact ON fact_entity_mentions(fact_id);
+CREATE INDEX IF NOT EXISTS idx_mentions_entity ON fact_entity_mentions(entity_id);
+
+CREATE TABLE IF NOT EXISTS knowledge_edges (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_entity_id       INTEGER NOT NULL REFERENCES entities(id),
+  predicate              TEXT NOT NULL,
+  target_entity_id       INTEGER NOT NULL REFERENCES entities(id),
+  confidence             REAL NOT NULL DEFAULT 1.0,
+  source_fact_id          INTEGER REFERENCES facts(id),
+  source_burst_id         INTEGER REFERENCES conversation_bursts(id),
+  extracted_at            INTEGER NOT NULL,
+  event_ts                INTEGER,
+  valid_from_ts           INTEGER,
+  valid_to_ts             INTEGER,
+  status                  TEXT NOT NULL DEFAULT 'active',
+  superseded_by_edge_id   INTEGER REFERENCES knowledge_edges(id),
+  deleted_at              INTEGER,
+  qualifiers_json         TEXT NOT NULL DEFAULT '{}',
+  UNIQUE(source_entity_id, predicate, target_entity_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_edges_source ON knowledge_edges(source_entity_id, predicate);
+CREATE INDEX IF NOT EXISTS idx_edges_target ON knowledge_edges(target_entity_id, predicate);
+CREATE INDEX IF NOT EXISTS idx_edges_fact ON knowledge_edges(source_fact_id);
+CREATE INDEX IF NOT EXISTS idx_edges_active_source
+  ON knowledge_edges(source_entity_id)
+  WHERE status = 'active' AND deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_edges_active_target
+  ON knowledge_edges(target_entity_id)
+  WHERE status = 'active' AND deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS edge_sources (
+  edge_id      INTEGER NOT NULL REFERENCES knowledge_edges(id) ON DELETE CASCADE,
+  fact_id      INTEGER NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+  burst_id     INTEGER REFERENCES conversation_bursts(id),
+  attached_at  INTEGER NOT NULL,
+  PRIMARY KEY(edge_id, fact_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_edge_sources_fact ON edge_sources(fact_id);

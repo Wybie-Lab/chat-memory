@@ -1,5 +1,7 @@
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import { generateObject, generateText } from 'ai';
+import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 import { z } from 'zod';
+import { ENTITY_ROLES, ENTITY_TYPES, GRAPH_PREDICATES } from './provider';
 import type {
   LLMProvider,
   BurstInput,
@@ -7,16 +9,25 @@ import type {
   ConsolidateInput,
   ConsolidationOp,
   EmbedMode,
+  GraphFactInput,
   SummarizeClusterInput,
   UsageMetadata,
 } from './provider';
 
-const FILTER_MODEL = 'claude-haiku-4-5';
-const EXTRACT_MODEL = 'claude-sonnet-4-6';
-const CONSOLIDATE_MODEL = 'claude-sonnet-4-6';
-const SUMMARIZE_MODEL = 'claude-sonnet-4-6';
-const CHAT_MODEL = 'claude-sonnet-4-6';
+const DEFAULT_OPENROUTER_MODEL = process.env.OPENROUTER_MODEL ?? 'google/gemini-2.5-flash';
+const FILTER_MODEL = process.env.OPENROUTER_FILTER_MODEL ?? DEFAULT_OPENROUTER_MODEL;
+const EXTRACT_MODEL = process.env.OPENROUTER_EXTRACT_MODEL ?? DEFAULT_OPENROUTER_MODEL;
+const CONSOLIDATE_MODEL = process.env.OPENROUTER_CONSOLIDATE_MODEL ?? DEFAULT_OPENROUTER_MODEL;
+const SUMMARIZE_MODEL = process.env.OPENROUTER_SUMMARIZE_MODEL ?? DEFAULT_OPENROUTER_MODEL;
+const GRAPH_MODEL = process.env.OPENROUTER_GRAPH_MODEL ?? DEFAULT_OPENROUTER_MODEL;
+const CHAT_MODEL = process.env.OPENROUTER_CHAT_MODEL ?? DEFAULT_OPENROUTER_MODEL;
 const EMBED_MODEL = 'embed-multilingual-v3.0';
+
+const openrouter = createOpenRouter({
+  apiKey: process.env.OPENROUTER_API_KEY,
+  appName: process.env.OPENROUTER_APP_NAME ?? 'manila-memory',
+  appUrl: process.env.OPENROUTER_APP_URL,
+});
 
 const CHAT_SYSTEM_PROMPT = `You answer questions about the user's WhatsApp contacts using only the structured <memory> block provided.
 
@@ -267,8 +278,211 @@ const SummarizeZod = z.object({
   summary: z.string(),
 });
 
+const GRAPH_SYSTEM_PROMPT = `You extract a small, source-backed knowledge graph from ONE already-consolidated memory fact.
+
+The input fact is already cleaned and grounded. Your job is to identify explicit entities and explicit relationships supported by that fact. The graph is a projection of the fact, not a place for inference.
+
+Allowed entity types:
+- person
+- place
+- organization
+- event
+- preference_topic
+- object
+- concept
+- date
+
+Allowed entity roles:
+- subject
+- object
+- person
+- place
+- organization
+- event
+- date
+- topic
+- source
+- recipient
+
+Allowed predicates:
+- knows
+- friend_of
+- family_of
+- partner_of
+- works_at
+- studies_at
+- lives_in
+- from_place
+- located_in
+- likes
+- dislikes
+- interested_in
+- attending
+- planning
+- visited
+- promised_to
+- needs
+- owns
+- part_of
+- mentioned
+
+Rules:
+- Extract only what the fact literally supports. Do not infer hidden relationships.
+- Prefer no edge over a weak edge.
+- Use the fact subject as an entity when the fact is about that subject.
+- Every edge endpoint must refer to an entity in the entities array.
+- Use stable local_id values like "subject", "venice", "riley"; local_id only needs to be unique within this response.
+- For relationship facts, capture the actual relationship if explicit.
+- For vague references where no stronger predicate is supported, use mentioned sparingly.
+- For planned future events, prefer planning or attending. Do not convert plans into completed facts.
+- For promises, use promised_to with the promiser as source and recipient as target when both are explicit.
+- Do not create located_in edges unless the fact explicitly says one thing is located in another.
+- Return empty arrays if the fact has no explicit graph structure.
+
+Return JSON only, matching the provided schema.`;
+
+const GRAPH_SCHEMA_JSON = {
+  type: 'object',
+  properties: {
+    entities: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          local_id: { type: 'string' },
+          type: { type: 'string', enum: [...ENTITY_TYPES] },
+          display_name: { type: 'string' },
+          aliases: { type: 'array', items: { type: 'string' } },
+          confidence: { type: 'number' },
+        },
+        required: ['local_id', 'type', 'display_name', 'confidence'],
+        additionalProperties: false,
+      },
+    },
+    mentions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          entity_local_id: { type: 'string' },
+          role: { type: 'string', enum: [...ENTITY_ROLES] },
+          mention_text: { type: 'string' },
+          confidence: { type: 'number' },
+        },
+        required: ['entity_local_id', 'role', 'confidence'],
+        additionalProperties: false,
+      },
+    },
+    edges: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          source_local_id: { type: 'string' },
+          predicate: { type: 'string', enum: [...GRAPH_PREDICATES] },
+          target_local_id: { type: 'string' },
+          confidence: { type: 'number' },
+          event_ts: { type: ['number', 'null'] },
+          valid_from_ts: { type: ['number', 'null'] },
+          valid_to_ts: { type: ['number', 'null'] },
+          qualifiers: { type: 'object', additionalProperties: true },
+        },
+        required: ['source_local_id', 'predicate', 'target_local_id', 'confidence'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['entities', 'mentions', 'edges'],
+  additionalProperties: false,
+} as const;
+
+const GraphZod = z.object({
+  entities: z.array(
+    z.object({
+      local_id: z.string().min(1),
+      type: z.enum(ENTITY_TYPES),
+      display_name: z.string().min(1),
+      aliases: z.array(z.string()).optional(),
+      confidence: z.number().min(0).max(1),
+    })
+  ),
+  mentions: z.array(
+    z.object({
+      entity_local_id: z.string().min(1),
+      role: z.enum(ENTITY_ROLES),
+      mention_text: z.string().optional(),
+      confidence: z.number().min(0).max(1),
+    })
+  ),
+  edges: z.array(
+    z.object({
+      source_local_id: z.string().min(1),
+      predicate: z.enum(GRAPH_PREDICATES),
+      target_local_id: z.string().min(1),
+      confidence: z.number().min(0).max(1),
+      event_ts: z.number().int().nullable().optional(),
+      valid_from_ts: z.number().int().nullable().optional(),
+      valid_to_ts: z.number().int().nullable().optional(),
+      qualifiers: z.record(z.unknown()).optional(),
+    })
+  ),
+});
+
+const LooseGraphZod = z.object({
+  entities: z
+    .array(
+      z.object({
+        local_id: z.string().min(1).optional(),
+        id: z.string().min(1).optional(),
+        type: z.string().min(1).optional(),
+        display_name: z.string().min(1).optional(),
+        name: z.string().min(1).optional(),
+        labels: z.array(z.string()).optional(),
+        aliases: z.array(z.string()).optional(),
+        confidence: z.number().min(0).max(1).optional(),
+      }).passthrough()
+    )
+    .default([]),
+  mentions: z
+    .array(
+      z.object({
+        entity_local_id: z.string().min(1).optional(),
+        entity_id: z.string().min(1).optional(),
+        role: z.string().min(1).optional(),
+        mention_text: z.string().optional(),
+        text: z.string().optional(),
+        confidence: z.number().min(0).max(1).optional(),
+      }).passthrough()
+    )
+    .default([]),
+  edges: z
+    .array(
+      z.object({
+        source_local_id: z.string().min(1).optional(),
+        target_local_id: z.string().min(1).optional(),
+        source: z.string().min(1).optional(),
+        target: z.string().min(1).optional(),
+        subject: z.string().min(1).optional(),
+        object: z.string().min(1).optional(),
+        predicate: z.string().min(1).optional(),
+        confidence: z.number().min(0).max(1).optional(),
+        event_ts: z.number().int().nullable().optional(),
+        valid_from_ts: z.number().int().nullable().optional(),
+        valid_to_ts: z.number().int().nullable().optional(),
+        qualifiers: z.record(z.unknown()).optional(),
+      }).passthrough()
+    )
+    .default([]),
+});
+
 interface AgentCallResult {
   structured: unknown;
+  tokens_in: number;
+  tokens_out: number;
+}
+
+interface TextCallResult {
+  text: string;
   tokens_in: number;
   tokens_out: number;
 }
@@ -277,65 +491,93 @@ async function callAgent(args: {
   systemPrompt: string;
   userPrompt: string;
   model: string;
-  outputSchema: Record<string, unknown>;
+  outputSchema: z.ZodTypeAny;
+  outputSchemaJson?: Record<string, unknown>;
 }): Promise<AgentCallResult> {
-  const stream = query({
-    prompt: args.userPrompt,
-    options: {
-      systemPrompt: args.systemPrompt,
+  const generate = generateObject as unknown as (options: {
+    model: unknown;
+    system: string;
+    prompt: string;
+    schema: z.ZodTypeAny;
+    temperature: number;
+    maxRetries: number;
+  }) => Promise<{ object: unknown; usage: { inputTokens?: number; outputTokens?: number } }>;
+
+  try {
+    const result = await generate({
+      model: openrouter(args.model),
+      system: args.systemPrompt,
+      prompt: args.userPrompt,
+      schema: args.outputSchema,
+      temperature: 0,
+      maxRetries: 2,
+    });
+    return {
+      structured: result.object,
+      tokens_in: result.usage.inputTokens ?? 0,
+      tokens_out: result.usage.outputTokens ?? 0,
+    };
+  } catch (err) {
+    const fallback = await callText({
       model: args.model,
-      outputFormat: { type: 'json_schema', schema: args.outputSchema },
-      allowedTools: [],
-      maxTurns: 5,
-      settingSources: [],
-    },
-  });
+      systemPrompt: `${args.systemPrompt}
 
-  let structured: unknown = undefined;
-  let tokens_in = 0;
-  let tokens_out = 0;
-  const trace: string[] = [];
-
-  for await (const message of stream) {
-    if (message.type === 'assistant') {
-      const blocks = message.message.content
-        .map((b: { type: string; text?: string }) =>
-          b.type === 'text' && typeof b.text === 'string' ? `text(${b.text.slice(0, 80)})` : b.type
-        )
-        .join(',');
-      trace.push(`assistant[${blocks}]${message.error ? ` ERR:${message.error}` : ''}`);
-      continue;
-    }
-    if (message.type !== 'result') continue;
-
-    if (message.subtype !== 'success') {
-      const errs = message.errors.length ? message.errors.join('; ') : '(no error message)';
-      throw new Error(
-        `claude-agent-sdk ${message.subtype}: ${errs} | turns=${message.num_turns} | trace=${trace.join(' → ')}`
-      );
-    }
-
-    structured = message.structured_output;
-    for (const u of Object.values(message.modelUsage)) {
-      tokens_in += u.inputTokens;
-      tokens_out += u.outputTokens;
-    }
+Return ONLY valid JSON. Do not wrap it in markdown.${
+        args.outputSchemaJson
+          ? `\nThe JSON must match this schema:\n${JSON.stringify(args.outputSchemaJson)}`
+          : ''
+      }`,
+      userPrompt: args.userPrompt,
+    });
+    return {
+      structured: parseStructuredJson(fallback.text),
+      tokens_in: fallback.tokens_in,
+      tokens_out: fallback.tokens_out,
+    };
   }
-
-  if (structured === undefined) {
-    throw new Error(`claude-agent-sdk returned no structured output. trace=${trace.join(' → ')}`);
-  }
-
-  return { structured, tokens_in, tokens_out };
 }
 
-export class ClaudeProvider implements LLMProvider {
+async function callText(args: {
+  systemPrompt: string;
+  userPrompt: string;
+  model: string;
+}): Promise<TextCallResult> {
+  const result = await generateText({
+    model: openrouter(args.model),
+    system: args.systemPrompt,
+    prompt: args.userPrompt,
+    temperature: 0,
+    maxRetries: 2,
+  });
+  return {
+    text: result.text,
+    tokens_in: result.usage.inputTokens ?? 0,
+    tokens_out: result.usage.outputTokens ?? 0,
+  };
+}
+
+function parseStructuredJson(content: string): unknown {
+  const trimmed = content.trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    if (fenced) return JSON.parse(fenced[1]);
+    const first = trimmed.indexOf('{');
+    const last = trimmed.lastIndexOf('}');
+    if (first >= 0 && last > first) return JSON.parse(trimmed.slice(first, last + 1));
+    throw new Error(`openrouter returned non-JSON structured output: ${trimmed.slice(0, 200)}`);
+  }
+}
+
+export class OpenRouterProvider implements LLMProvider {
   async filterBurst(input: BurstInput) {
     const result = await callAgent({
       systemPrompt: FILTER_SYSTEM_PROMPT,
       userPrompt: formatBurstMessage(input, 'filter'),
       model: FILTER_MODEL,
-      outputSchema: FILTER_SCHEMA_JSON as unknown as Record<string, unknown>,
+      outputSchema: FilterZod,
+      outputSchemaJson: FILTER_SCHEMA_JSON as unknown as Record<string, unknown>,
     });
     const parsed = FilterZod.parse(result.structured);
     return {
@@ -350,7 +592,8 @@ export class ClaudeProvider implements LLMProvider {
       systemPrompt: EXTRACT_SYSTEM_PROMPT,
       userPrompt: formatBurstMessage(input, 'extract'),
       model: EXTRACT_MODEL,
-      outputSchema: EXTRACT_SCHEMA_JSON as unknown as Record<string, unknown>,
+      outputSchema: ExtractZod,
+      outputSchemaJson: EXTRACT_SCHEMA_JSON as unknown as Record<string, unknown>,
     });
     const parsed = ExtractZod.parse(result.structured);
     return {
@@ -364,7 +607,8 @@ export class ClaudeProvider implements LLMProvider {
       systemPrompt: CONSOLIDATE_SYSTEM_PROMPT,
       userPrompt: formatConsolidateMessage(input),
       model: CONSOLIDATE_MODEL,
-      outputSchema: CONSOLIDATE_SCHEMA_JSON as unknown as Record<string, unknown>,
+      outputSchema: ConsolidateZod,
+      outputSchemaJson: CONSOLIDATE_SCHEMA_JSON as unknown as Record<string, unknown>,
     });
     const parsed = ConsolidateZod.parse(result.structured);
 
@@ -384,12 +628,37 @@ export class ClaudeProvider implements LLMProvider {
       systemPrompt: SUMMARIZE_SYSTEM_PROMPT,
       userPrompt: formatSummarizeMessage(input),
       model: SUMMARIZE_MODEL,
-      outputSchema: SUMMARIZE_SCHEMA_JSON as unknown as Record<string, unknown>,
+      outputSchema: SummarizeZod,
+      outputSchemaJson: SUMMARIZE_SCHEMA_JSON as unknown as Record<string, unknown>,
     });
     const parsed = SummarizeZod.parse(result.structured);
     return {
       summary: parsed.summary.trim(),
       usage: usageOf(SUMMARIZE_MODEL, result),
+    };
+  }
+
+  async extractGraphFromFact(input: GraphFactInput) {
+    const result = await callText({
+      systemPrompt: `${GRAPH_SYSTEM_PROMPT}
+
+Return ONLY a JSON object with this exact shape:
+{"entities":[],"mentions":[],"edges":[]}
+Do not wrap it in markdown.`,
+      userPrompt: formatGraphFactMessage(input),
+      model: GRAPH_MODEL,
+    });
+    const parsed = normalizeGraph(LooseGraphZod.parse(parseStructuredJson(result.text)));
+    const localIds = new Set(parsed.entities.map((e) => e.local_id));
+    return {
+      graph: {
+        entities: parsed.entities,
+        mentions: parsed.mentions.filter((m) => localIds.has(m.entity_local_id)),
+        edges: parsed.edges.filter(
+          (e) => localIds.has(e.source_local_id) && localIds.has(e.target_local_id)
+        ),
+      },
+      usage: { model: GRAPH_MODEL, tokens_in: result.tokens_in, tokens_out: result.tokens_out },
     };
   }
 
@@ -433,54 +702,27 @@ export class ClaudeProvider implements LLMProvider {
   }
 
   async chat(input: ChatInput) {
-    const userPrompt = formatChatMessage(input);
-    const stream = query({
-      prompt: userPrompt,
-      options: {
-        systemPrompt: CHAT_SYSTEM_PROMPT,
-        model: CHAT_MODEL,
-        allowedTools: [],
-        maxTurns: 5,
-        settingSources: [],
-      },
+    const result = await callText({
+      model: CHAT_MODEL,
+      systemPrompt: CHAT_SYSTEM_PROMPT,
+      userPrompt: formatChatMessage(input),
     });
-
-    let answer = '';
-    let tokens_in = 0;
-    let tokens_out = 0;
-
-    for await (const message of stream) {
-      if (message.type === 'assistant') {
-        for (const block of message.message.content) {
-          const b = block as { type: string; text?: string };
-          if (b.type === 'text' && typeof b.text === 'string') {
-            answer += b.text;
-          }
-        }
-      } else if (message.type === 'result') {
-        if (message.subtype !== 'success') {
-          const errs = message.errors.length ? message.errors.join('; ') : '(no error message)';
-          throw new Error(`claude-agent-sdk chat ${message.subtype}: ${errs}`);
-        }
-        for (const u of Object.values(message.modelUsage)) {
-          tokens_in += u.inputTokens;
-          tokens_out += u.outputTokens;
-        }
-      }
-    }
-
     return {
-      answer: answer.trim(),
-      usage: { model: CHAT_MODEL, tokens_in, tokens_out },
+      answer: result.text.trim(),
+      usage: {
+        model: CHAT_MODEL,
+        tokens_in: result.tokens_in,
+        tokens_out: result.tokens_out,
+      },
     };
   }
 }
 
 export function createLLMProvider(): LLMProvider {
-  const kind = (process.env.LLM_PROVIDER ?? 'claude').toLowerCase();
+  const kind = (process.env.LLM_PROVIDER ?? 'openrouter').toLowerCase();
   switch (kind) {
-    case 'claude':
-      return new ClaudeProvider();
+    case 'openrouter':
+      return new OpenRouterProvider();
     default:
       throw new Error(`unknown LLM provider: ${kind}`);
   }
@@ -518,6 +760,98 @@ function usageOf(model: string, result: AgentCallResult): UsageMetadata {
     tokens_in: result.tokens_in,
     tokens_out: result.tokens_out,
   };
+}
+
+function normalizeGraph(raw: z.infer<typeof LooseGraphZod>): z.infer<typeof GraphZod> {
+  const entityTypes = new Set<string>(ENTITY_TYPES);
+  const entityRoles = new Set<string>(ENTITY_ROLES);
+  const predicates = new Set<string>(GRAPH_PREDICATES);
+
+  const entities = raw.entities
+    .map((e) => {
+      const localId = e.local_id ?? e.id ?? e.name ?? e.display_name ?? e.labels?.[0];
+      const displayName = e.display_name ?? e.name ?? e.labels?.[0] ?? e.id ?? e.local_id;
+      return {
+        local_id: localId ?? '',
+        type: normalizeEntityType(e.type),
+        display_name: displayName ?? '',
+        aliases: e.aliases ?? e.labels?.filter((label) => label !== displayName),
+        confidence: e.confidence ?? 0.7,
+      };
+    })
+    .filter((e) => e.local_id && e.display_name && entityTypes.has(e.type));
+
+  const localIds = new Set(entities.map((e) => e.local_id));
+  const entityTypeById = new Map(entities.map((e) => [e.local_id, e.type]));
+
+  const mentions = raw.mentions
+    .map((m) => {
+      const entityId = m.entity_local_id ?? m.entity_id;
+      return {
+        entity_local_id: entityId ?? '',
+        role: normalizeRole(m.role, entityId ? entityTypeById.get(entityId) : undefined),
+        mention_text: m.mention_text ?? m.text,
+        confidence: m.confidence ?? 0.7,
+      };
+    })
+    .filter((m) => localIds.has(m.entity_local_id) && entityRoles.has(m.role));
+
+  const edges = raw.edges
+    .map((e) => ({
+      source_local_id: e.source_local_id ?? e.source ?? e.subject ?? '',
+      predicate: normalizePredicate(e.predicate),
+      target_local_id: e.target_local_id ?? e.target ?? e.object ?? '',
+      confidence: e.confidence ?? 0.7,
+      event_ts: e.event_ts,
+      valid_from_ts: e.valid_from_ts,
+      valid_to_ts: e.valid_to_ts,
+      qualifiers: e.qualifiers,
+    }))
+    .filter(
+      (e) =>
+        localIds.has(e.source_local_id) &&
+        localIds.has(e.target_local_id) &&
+        predicates.has(e.predicate)
+    );
+
+  return GraphZod.parse({ entities, mentions, edges });
+}
+
+function normalizeToken(value: string | undefined): string {
+  return (value ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+}
+
+function normalizeEntityType(value: string | undefined): string {
+  const token = normalizeToken(value);
+  if (token === 'location' || token === 'city' || token === 'country') return 'place';
+  if (token === 'company' || token === 'school' || token === 'university') return 'organization';
+  if (token === 'transportation_method' || token === 'vehicle') return 'object';
+  if (token === 'topic') return 'preference_topic';
+  return token || 'concept';
+}
+
+function normalizeRole(value: string | undefined, entityType: string | undefined): string {
+  const token = normalizeToken(value);
+  if (token && token !== 'unknown') return token;
+  if (entityType === 'place') return 'place';
+  if (entityType === 'organization') return 'organization';
+  if (entityType === 'event') return 'event';
+  if (entityType === 'date') return 'date';
+  if (entityType === 'preference_topic' || entityType === 'concept') return 'topic';
+  if (entityType === 'person') return 'person';
+  return 'object';
+}
+
+function normalizePredicate(value: string | undefined): string {
+  const token = normalizeToken(value);
+  if (token === 'is_visiting' || token === 'visiting' || token === 'goes_to') return 'visited';
+  if (token === 'leaving' || token === 'leaving_from' || token === 'departing_from') {
+    return 'from_place';
+  }
+  if (token === 'arriving_by' || token === 'travels_by' || token === 'using') return 'mentioned';
+  if (token === 'works_for') return 'works_at';
+  if (token === 'lives_at') return 'lives_in';
+  return token;
 }
 
 function formatConsolidateMessage(input: ConsolidateInput): string {
@@ -614,6 +948,20 @@ function formatSummarizeMessage(input: SummarizeClusterInput): string {
     );
   }
   lines.push('', `Write the rolled-up summary for "${subjectLabel}" (${input.category}).`);
+  return lines.join('\n');
+}
+
+function formatGraphFactMessage(input: GraphFactInput): string {
+  const lines = [
+    `Fact ID: ${input.fact_id}`,
+    `Subject: ${input.subject}`,
+    `Category: ${input.category}`,
+    `Confidence: ${input.confidence.toFixed(2)}`,
+  ];
+  if (input.event_ts) {
+    lines.push(`Event time: ${new Date(input.event_ts * 1000).toISOString()}`);
+  }
+  lines.push('', 'Fact:', input.content, '', 'Extract the explicit graph projection for this fact.');
   return lines.join('\n');
 }
 

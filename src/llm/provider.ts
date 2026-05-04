@@ -74,6 +74,94 @@ export interface SummarizeClusterInput {
   }>;
 }
 
+export const ENTITY_TYPES = [
+  'person',
+  'place',
+  'organization',
+  'event',
+  'preference_topic',
+  'object',
+  'concept',
+  'date',
+] as const;
+
+export type EntityType = (typeof ENTITY_TYPES)[number];
+
+export const ENTITY_ROLES = [
+  'subject',
+  'object',
+  'person',
+  'place',
+  'organization',
+  'event',
+  'date',
+  'topic',
+  'source',
+  'recipient',
+] as const;
+
+export type EntityRole = (typeof ENTITY_ROLES)[number];
+
+export const GRAPH_PREDICATES = [
+  'knows',
+  'friend_of',
+  'family_of',
+  'partner_of',
+  'works_at',
+  'studies_at',
+  'lives_in',
+  'from_place',
+  'located_in',
+  'likes',
+  'dislikes',
+  'interested_in',
+  'attending',
+  'planning',
+  'visited',
+  'promised_to',
+  'needs',
+  'owns',
+  'part_of',
+  'mentioned',
+] as const;
+
+export type GraphPredicate = (typeof GRAPH_PREDICATES)[number];
+
+export interface ExtractedGraph {
+  entities: Array<{
+    local_id: string;
+    type: EntityType;
+    display_name: string;
+    aliases?: string[];
+    confidence: number;
+  }>;
+  mentions: Array<{
+    entity_local_id: string;
+    role: EntityRole;
+    mention_text?: string;
+    confidence: number;
+  }>;
+  edges: Array<{
+    source_local_id: string;
+    predicate: GraphPredicate;
+    target_local_id: string;
+    confidence: number;
+    event_ts?: number | null;
+    valid_from_ts?: number | null;
+    valid_to_ts?: number | null;
+    qualifiers?: Record<string, unknown>;
+  }>;
+}
+
+export interface GraphFactInput {
+  fact_id: number;
+  subject: string;
+  category: FactCategory;
+  content: string;
+  confidence: number;
+  event_ts?: number | null;
+}
+
 export type ConsolidationOp =
   | { op: 'ADD'; candidate_index: number; content: string; category: FactCategory; confidence: number }
   | { op: 'UPDATE'; candidate_index: number; old_fact_id: number; content: string; category: FactCategory; confidence: number }
@@ -89,6 +177,9 @@ export interface LLMProvider {
   summarizeCluster(
     input: SummarizeClusterInput
   ): Promise<{ summary: string; usage: UsageMetadata }>;
+  extractGraphFromFact(
+    input: GraphFactInput
+  ): Promise<{ graph: ExtractedGraph; usage: UsageMetadata }>;
   embed(text: string, mode?: EmbedMode): Promise<{ vector: number[]; usage: UsageMetadata }>;
   chat(input: ChatInput): Promise<{ answer: string; usage: UsageMetadata }>;
 }
