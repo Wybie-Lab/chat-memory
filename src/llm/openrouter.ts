@@ -190,23 +190,41 @@ const ExtractZod = z.object({
   ),
 });
 
-const CONSOLIDATE_SYSTEM_PROMPT = `You are merging new candidate facts into an existing memory about ONE subject. For each candidate, decide one of:
+const CONNECTION_PREDICATES = [
+  'update',
+  'state_change',
+  'expands',
+  'qualifies',
+  'contradicts',
+  'retracts',
+  'same_as',
+] as const;
 
-- ADD: candidate is genuinely new info not covered by any existing fact. Insert as a new fact.
-- UPDATE: candidate refines, replaces, or contradicts ONE specific existing fact (named by old_fact_id). The existing fact will be marked superseded; the candidate becomes the new active fact.
-- DELETE: an existing fact is now known to be wrong or obsolete, and the candidate provides no replacement worth keeping. Remove the existing fact; do not add the candidate.
-- DROP: the candidate is fully redundant with an existing fact (same info, no new detail). Ignore the candidate; keep memory unchanged.
+const CONSOLIDATE_SYSTEM_PROMPT = `You are merging new candidate facts into an APPEND-ONLY memory about ONE subject. Memory rows are immutable: facts are never deleted or mutated. Instead, every change is a new fact + a typed connection back to what it relates to.
+
+For each candidate, decide one of:
+
+- ADD: candidate is a new fact unrelated to anything existing. Insert as a new fact, no connections.
+
+- CONNECT: candidate is a new fact that relates to ONE specific existing fact (named by old_fact_id). Insert the new fact AND record a connection from new → old. Choose the predicate that best describes the relationship:
+    update        — same thing, new state. Examples: "lives in Berlin" → "lives in Lisbon"; "single" → "engaged"; "works at Stripe" → "works at Anthropic".
+    state_change  — discrete event that changed state. Examples: "has a dog" → "the dog passed away"; "was at home" → "left for work".
+    expands       — same fact, more specific. Examples: "Sam has a pet" → "Sam has a dog named Rex"; "lives in Italy" → "lives in Rome".
+    qualifies     — adds a condition or nuance. Examples: "works at the bank" → "works part-time at the bank"; "goes to gym" → "goes to gym on weekends only".
+    contradicts   — irreconcilable, no resolution. Examples: "lives in Rome" ↔ "lives in Milan" (when both seem asserted, no clear winner). Use sparingly.
+    retracts      — old fact was wrong (extractor hallucination, miscommunication). Examples: existing fact "Emma has a cat" + candidate "actually it's a dog". The candidate is the corrected fact.
+    same_as       — candidate restates the existing fact (almost-duplicate). Use only when the candidate adds something — like a clarification or another source — but the underlying fact is the same. If it adds NOTHING, prefer DROP.
+
+- DROP: candidate is fully redundant — same info, no new detail, no new clarification. Ignore the candidate; memory unchanged.
 
 Rules:
-- Each candidate must appear in exactly one op (ADD, UPDATE, or DROP). DELETE ops do not consume a candidate.
-- An existing fact may appear in at most one op (UPDATE or DELETE) — never both.
-- Existing facts not mentioned in any op are kept as-is.
-- Prefer UPDATE over ADD+DELETE pairs when a candidate clearly supersedes one specific fact (e.g. "lives in Berlin" → "lives in Lisbon").
-- Prefer DROP over UPDATE when the candidate adds no real information ("works at Stripe" candidate when existing fact already says "works at Stripe as a backend engineer").
-- For UPDATE: copy the candidate's content/category/confidence verbatim into the op (these become the new fact's stored values). Do NOT merge or paraphrase.
-- For ADD: same — content/category/confidence come from the candidate.
-- For DELETE: provide a one-sentence reason citing the contradicting candidate.
-- For DROP: provide a one-sentence reason naming the redundant existing fact.
+- Each candidate must appear in exactly ONE op (ADD, CONNECT, or DROP). Every candidate is covered.
+- An existing fact may be the target of multiple CONNECT ops (e.g. two candidates both update the same fact) — that's fine; both new facts go in with separate connections.
+- Existing facts not mentioned in any op are kept as-is. Memory grows; nothing is removed.
+- Prefer CONNECT(predicate=expands) over CONNECT(predicate=update) when the candidate adds detail without contradicting. Prefer update only when the new fact replaces the old's claim.
+- Prefer DROP over CONNECT(same_as) when the candidate adds nothing.
+- For ADD and CONNECT: the new fact's content/category/confidence are the candidate's verbatim values. Do not paraphrase.
+- For CONNECT: include a one-sentence reason explaining why this predicate fits.
 
 WORKED EXAMPLE.
 Subject: Sam
@@ -219,11 +237,13 @@ New candidates:
   [0] (fact, conf=0.92) Sam lives in Lisbon now (moved last month).
   [1] (preference, conf=0.80) Sam likes jazz.
   [2] (commitment, conf=0.85) Sam promised to send me her Umbria Jazz photos.
+  [3] (event, conf=0.90) Sam's family dog passed away yesterday.
 
 Correct ops:
-  - UPDATE: candidate_index=0, old_fact_id=7 (Sam moved Berlin → Lisbon — the Stripe employer detail is also part of fact 7, but the candidate is silent on it; choose UPDATE because candidate clearly supersedes the location, and re-asserting Stripe without evidence would invent info.)
-  - DROP: candidate_index=1, reason="redundant with fact 3 which already records jazz preference with more detail."
-  - ADD: candidate_index=2 (new commitment, no existing fact covers it).
+  - CONNECT: candidate_index=0, old_fact_id=7, predicate=update — Sam moved Berlin → Lisbon. The new fact replaces the location claim; old fact stays in memory as the prior state.
+  - DROP: candidate_index=1 — fact 3 already covers Sam's jazz preference with more detail.
+  - ADD: candidate_index=2 — new commitment, no existing fact covers it.
+  - ADD: candidate_index=3 — first mention of a family dog; nothing existing relates.
 
 Return ops strictly as JSON matching the schema.`;
 
@@ -235,9 +255,10 @@ const CONSOLIDATE_SCHEMA_JSON = {
       items: {
         type: 'object',
         properties: {
-          op: { type: 'string', enum: ['ADD', 'UPDATE', 'DELETE', 'DROP'] },
+          op: { type: 'string', enum: ['ADD', 'CONNECT', 'DROP'] },
           candidate_index: { type: 'integer' },
           old_fact_id: { type: 'integer' },
+          predicate: { type: 'string', enum: [...CONNECTION_PREDICATES] },
           content: { type: 'string' },
           category: { type: 'string', enum: [...FACT_CATEGORIES] },
           confidence: { type: 'number' },
@@ -255,9 +276,10 @@ const CONSOLIDATE_SCHEMA_JSON = {
 const ConsolidateZod = z.object({
   ops: z.array(
     z.object({
-      op: z.enum(['ADD', 'UPDATE', 'DELETE', 'DROP']),
+      op: z.enum(['ADD', 'CONNECT', 'DROP']),
       candidate_index: z.number().int().optional(),
       old_fact_id: z.number().int().optional(),
+      predicate: z.enum(CONNECTION_PREDICATES).optional(),
       content: z.string().optional(),
       category: z.enum(FACT_CATEGORIES).optional(),
       confidence: z.number().min(0).max(1).optional(),
@@ -915,23 +937,25 @@ function validateOp(
         category: raw.category,
         confidence: raw.confidence,
       };
-    case 'UPDATE':
-      if (!candIdxOk || !oldIdOk || !raw.content || !raw.category || raw.confidence === undefined) {
+    case 'CONNECT':
+      if (
+        !candIdxOk ||
+        !oldIdOk ||
+        !raw.predicate ||
+        !raw.content ||
+        !raw.category ||
+        raw.confidence === undefined
+      ) {
         return null;
       }
       return {
-        op: 'UPDATE',
+        op: 'CONNECT',
         candidate_index: raw.candidate_index!,
         old_fact_id: raw.old_fact_id!,
+        predicate: raw.predicate,
         content: raw.content,
         category: raw.category,
         confidence: raw.confidence,
-      };
-    case 'DELETE':
-      if (!oldIdOk) return null;
-      return {
-        op: 'DELETE',
-        old_fact_id: raw.old_fact_id!,
         reason: raw.reason ?? '(no reason given)',
       };
     case 'DROP':

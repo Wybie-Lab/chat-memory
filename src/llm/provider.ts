@@ -162,10 +162,49 @@ export interface GraphFactInput {
   event_ts?: number | null;
 }
 
+/**
+ * The append-only memory model uses three consolidation ops:
+ *
+ *  - ADD     — candidate is a new fact, unrelated to anything existing.
+ *              Insert the fact. No connection.
+ *  - CONNECT — candidate is a new fact that relates to an existing one
+ *              via a typed connection. Insert the fact AND insert a
+ *              fact_connections row from the new fact to old_fact_id.
+ *              Predicate captures the kind of relationship:
+ *                update       — same thing, new state
+ *                state_change — discrete event changing state
+ *                expands      — adds detail / specificity
+ *                qualifies    — adds a condition or nuance
+ *                contradicts  — mutual exclusion (unresolved)
+ *                retracts     — old fact was wrong
+ *                same_as      — restating; mostly used by curator dedupe
+ *  - DROP    — candidate adds nothing; ignore it. Memory unchanged.
+ *
+ * Note: there is intentionally no DELETE op anymore. The append-only model
+ * preserves history; corrections happen via CONNECT(predicate=retracts)
+ * with a new replacement fact.
+ */
+export type ConnectionPredicate =
+  | 'update'
+  | 'state_change'
+  | 'expands'
+  | 'qualifies'
+  | 'contradicts'
+  | 'retracts'
+  | 'same_as';
+
 export type ConsolidationOp =
   | { op: 'ADD'; candidate_index: number; content: string; category: FactCategory; confidence: number }
-  | { op: 'UPDATE'; candidate_index: number; old_fact_id: number; content: string; category: FactCategory; confidence: number }
-  | { op: 'DELETE'; old_fact_id: number; reason: string }
+  | {
+      op: 'CONNECT';
+      candidate_index: number;
+      old_fact_id: number;
+      predicate: ConnectionPredicate;
+      content: string;
+      category: FactCategory;
+      confidence: number;
+      reason: string;
+    }
   | { op: 'DROP'; candidate_index: number; reason: string };
 
 export interface LLMProvider {

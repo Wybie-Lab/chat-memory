@@ -235,3 +235,71 @@ CREATE TABLE IF NOT EXISTS agent_actions (
 
 CREATE INDEX IF NOT EXISTS idx_agent_actions_run ON agent_actions(run_id);
 CREATE INDEX IF NOT EXISTS idx_agent_actions_status ON agent_actions(status);
+
+-- ───────────── Append-only memory model ─────────────
+-- Going forward, facts are immutable. Instead of mutating via
+-- superseded_by_id / deleted_at, every change is a new fact + a typed
+-- fact_connections row pointing back to what it modifies. Groups are
+-- topical buckets ("Emma — animals", "Emma — jobs") that facts attach
+-- to via fact_group_membership (many-to-many).
+
+-- Topical buckets. owner_subject_wa_id is optional — most groups will be
+-- per-subject ("Emma — animals"), but cross-subject groups are allowed
+-- (e.g. "shared trips").
+CREATE TABLE IF NOT EXISTS memory_groups (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  name                  TEXT NOT NULL,
+  description           TEXT,
+  owner_subject_wa_id   TEXT,                  -- nullable: cross-subject groups OK
+  created_at            INTEGER NOT NULL,
+  updated_at            INTEGER NOT NULL,
+  -- soft-delete reserved for future merge/retract of groups themselves.
+  -- Adding now to avoid a later migration on a populated table.
+  deleted_at            INTEGER,
+  UNIQUE(owner_subject_wa_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_groups_owner ON memory_groups(owner_subject_wa_id) WHERE deleted_at IS NULL;
+
+-- Many-to-many: a fact can sit in multiple groups (e.g. an event involving
+-- two people might belong to both "Emma — events" and "shared trips").
+CREATE TABLE IF NOT EXISTS fact_group_membership (
+  fact_id                  INTEGER NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+  group_id                 INTEGER NOT NULL REFERENCES memory_groups(id) ON DELETE CASCADE,
+  attached_at              INTEGER NOT NULL,
+  source_agent_action_id   INTEGER REFERENCES agent_actions(id),
+  PRIMARY KEY(fact_id, group_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fgm_group ON fact_group_membership(group_id);
+CREATE INDEX IF NOT EXISTS idx_fgm_fact ON fact_group_membership(fact_id);
+
+-- Typed directed edges between facts. The new fact (from_fact_id) modifies
+-- or relates to the older fact (to_fact_id) via `predicate`. Closed enum
+-- enforced at the SQLite level; the engine's TypeScript types mirror this.
+--   update        — same thing, new state          (Emma has a dog → Emma's dog died)
+--   state_change  — discrete event changing state  (Rex walks daily → Rex passed away)
+--   expands       — adds detail to same fact       (Emma has a pet → Emma has a dog Rex)
+--   qualifies     — adds a condition / nuance       (works at the bank → works part-time)
+--   contradicts   — mutual exclusion, unresolved   (lives in Rome ↔ lives in Milan)
+--   retracts      — old fact was wrong             (has a cat → actually a dog)
+--   same_as       — duplicates, deduped            (two extractions of the same event)
+CREATE TABLE IF NOT EXISTS fact_connections (
+  id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_fact_id             INTEGER NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+  to_fact_id               INTEGER NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+  predicate                TEXT NOT NULL CHECK (predicate IN (
+    'update', 'state_change', 'expands', 'qualifies',
+    'contradicts', 'retracts', 'same_as'
+  )),
+  confidence               REAL NOT NULL DEFAULT 1.0,
+  reason                   TEXT,
+  source_agent_action_id   INTEGER REFERENCES agent_actions(id),
+  created_at               INTEGER NOT NULL,
+  -- one (from, to, predicate) edge max — re-asserting the same connection
+  -- is idempotent.
+  UNIQUE(from_fact_id, to_fact_id, predicate)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fact_conn_from ON fact_connections(from_fact_id, predicate);
+CREATE INDEX IF NOT EXISTS idx_fact_conn_to ON fact_connections(to_fact_id, predicate);

@@ -89,6 +89,29 @@ export {
   DEFAULT_WEIGHTS,
 } from './retrieval/score';
 
+// ───────────── append-only memory (groups + connections) ─────────────
+// Going forward, fact mutation happens via new fact + typed connection,
+// not supersede/delete. Groups are topical buckets (many-to-many).
+export {
+  CONNECTION_PREDICATES,
+  createMemoryGroup,
+  getMemoryGroup,
+  listMemoryGroups,
+  addFactToGroup,
+  listFactGroups,
+  listFactsInGroup,
+  insertFactConnection,
+  listConnectionsFromFact,
+  listConnectionsToFact,
+  latestInChain,
+  type ConnectionPredicate,
+  type MemoryGroupRow,
+  type MemoryGroupInput,
+  type FactConnectionRow,
+  type FactConnectionInput,
+  type ListMemoryGroupsFilter,
+} from './storage/db';
+
 // ───────────── inspection / browsing (used by web UI + eval scoring) ─────────────
 export {
   listFacts,
@@ -126,6 +149,7 @@ export {
   attachEdgeSource,
   deactivateGraphForFact,
   graphCounts,
+  graphTimeline,
   searchEntities,
   graphNeighborhood,
   listGraphEntitiesWithStats,
@@ -158,6 +182,7 @@ export type {
   KnowledgeEdgeRow,
   GraphFactRow,
   GraphBuildStats,
+  GraphTimeline,
   GraphEntityWithStatsRow,
   SubjectInfo,
   SupersededFactRow,
