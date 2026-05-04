@@ -15,6 +15,7 @@ import {
   searchEntities,
   graphNeighborhood,
   graphCounts,
+  graphTimeline,
   listGraphEntitiesWithStats,
   listKnowledgeEdges,
   graphForFact,
@@ -28,6 +29,12 @@ import {
   getAgentRun,
   getAgentAction,
   listAgentActionsForRun,
+  listMemoryThreads,
+  getMemoryThread,
+  listFactsInThread,
+  listFactThreads,
+  listConnectionsFromFact,
+  listConnectionsToFact,
   type AgentRunStatus,
 } from '../engine';
 import { createLLMProvider } from '../llm';
@@ -158,11 +165,28 @@ app.get('/api/graph', (req: Request, res: Response) => {
   try {
     const entityLimit = req.query.entity_limit ? Math.min(Number(req.query.entity_limit), 1000) : 500;
     const edgeLimit = req.query.edge_limit ? Math.min(Number(req.query.edge_limit), 2000) : 1000;
+    const at =
+      typeof req.query.at === 'string' && req.query.at.trim()
+        ? Number(req.query.at)
+        : null;
+    if (at !== null && (!Number.isFinite(at) || at <= 0)) {
+      return res.status(400).json({ error: 'at must be a positive unix timestamp' });
+    }
     res.json({
-      counts: graphCounts(db),
-      entities: listGraphEntitiesWithStats(db, entityLimit),
-      edges: listKnowledgeEdges(db, edgeLimit),
+      counts: graphCounts(db, at),
+      timeline: graphTimeline(db),
+      entities: listGraphEntitiesWithStats(db, entityLimit, at),
+      edges: listKnowledgeEdges(db, edgeLimit, at),
     });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/graph/timeline', (req: Request, res: Response) => {
+  try {
+    const limit = req.query.limit ? Math.min(Number(req.query.limit), 2000) : 500;
+    res.json(graphTimeline(db, limit));
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -460,6 +484,73 @@ function approvedByFromBody(body: unknown): string {
   if (typeof raw === 'string' && raw.trim()) return raw.trim();
   return 'user:web';
 }
+
+// ───────────── Append-only memory: threads + connections ─────────────
+
+app.get('/api/threads', (req: Request, res: Response) => {
+  try {
+    const owner =
+      typeof req.query.owner_subject_wa_id === 'string'
+        ? req.query.owner_subject_wa_id
+        : undefined;
+    const threads = listMemoryThreads(db, {
+      owner_subject_wa_id: owner,
+      active_only: true,
+    });
+    // Annotate each thread with a fact count for the list view (cheap query).
+    const withCounts = threads.map((t) => {
+      const facts = listFactsInThread(db, t.id, 1000);
+      return { ...t, fact_count: facts.length };
+    });
+    res.json({ threads: withCounts });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/threads/:id', (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const threadId = Number(req.params.id);
+    if (!Number.isInteger(threadId) || threadId <= 0) {
+      return res.status(400).json({ error: 'thread id must be a positive integer' });
+    }
+    const thread = getMemoryThread(db, threadId);
+    if (!thread || thread.deleted_at !== null) {
+      return res.status(404).json({ error: `thread ${threadId} not found` });
+    }
+    const facts = listFactsInThread(db, threadId, 500);
+    res.json({ thread, facts });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/facts/:id/threads', (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const factId = Number(req.params.id);
+    if (!Number.isInteger(factId) || factId <= 0) {
+      return res.status(400).json({ error: 'fact id must be a positive integer' });
+    }
+    res.json({ threads: listFactThreads(db, factId) });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/facts/:id/connections', (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const factId = Number(req.params.id);
+    if (!Number.isInteger(factId) || factId <= 0) {
+      return res.status(400).json({ error: 'fact id must be a positive integer' });
+    }
+    res.json({
+      outgoing: listConnectionsFromFact(db, factId),
+      incoming: listConnectionsToFact(db, factId),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
 
 app.listen(port, () => {
   console.log(`manila web: http://localhost:${port}`);
