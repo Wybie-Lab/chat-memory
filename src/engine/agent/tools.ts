@@ -593,20 +593,35 @@ function toPositiveInt(v: unknown): number | null {
 }
 
 function toPositiveIntArray(v: unknown): number[] | null {
-  // Some models (notably Gemini Flash via structured-output) serialize nested
-  // arrays as JSON strings rather than real arrays. Accept either shape.
+  // Models (especially Gemini Flash via structured-output) serialize array
+  // arguments inconsistently. We accept any of:
+  //   [8, 7]            — real array (ideal)
+  //   "[8, 7]"          — JSON-stringified array
+  //   "8,7"  /  "8, 7"  — comma-separated string
+  //   8                 — single number, wrapped to [8]
+  //   "8"               — single numeric string, wrapped to [8]
   let arr: unknown = v;
   if (typeof arr === 'string') {
     const trimmed = arr.trim();
+    if (trimmed === '') return null;
     if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
       try {
         arr = JSON.parse(trimmed);
       } catch {
         return null;
       }
+    } else if (trimmed.includes(',')) {
+      arr = trimmed.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
     } else {
-      return null;
+      // Single numeric string — treat as a one-element array.
+      const n = toPositiveInt(trimmed);
+      if (n === null) return null;
+      return [n];
     }
+  } else if (typeof arr === 'number') {
+    const n = toPositiveInt(arr);
+    if (n === null) return null;
+    return [n];
   }
   if (!Array.isArray(arr)) return null;
   const out: number[] = [];

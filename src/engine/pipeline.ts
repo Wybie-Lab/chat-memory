@@ -18,6 +18,7 @@ import {
 } from './storage/db';
 import { writeExtractedGraph, type GraphFactContext } from './graph';
 import { refreshClusterSummary } from './cluster';
+import { planTriggeredRunsForFact } from './agent/curator';
 import type {
   LLMProvider,
   BurstInput,
@@ -434,6 +435,16 @@ async function processOne(
         log(
           `  burst ${burst.id} GRAPH fact ${job.fact_id}: entities=${written.entities} mentions=${written.mentions} edges=${written.edges}`
         );
+
+        // Entity-signal trigger: if this fact's graph touches an established
+        // entity via a type-defining predicate, queue a curator run. Cheap
+        // (DB-only) — actual execution is deferred to drainPlannedAgentRuns.
+        const triggered = planTriggeredRunsForFact(db, job.fact_id);
+        if (triggered.length > 0) {
+          log(
+            `  burst ${burst.id} TRIGGER fact ${job.fact_id}: queued curator runs ${triggered.join(',')}`
+          );
+        }
       } catch (err) {
         log(
           `  burst ${burst.id} GRAPH fact ${job.fact_id} ERROR: ${

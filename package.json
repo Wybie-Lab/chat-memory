@@ -9,6 +9,7 @@
     "backfill": "tsx scripts/backfill.ts",
     "import-chat": "tsx scripts/import-chat.ts",
     "process": "tsx scripts/process.ts",
+    "curator-drain": "tsx scripts/curator-drain.ts",
     "rebuild-graph": "tsx scripts/rebuild-graph.ts",
     "reset-pipeline": "tsx scripts/reset-pipeline.ts",
     "web": "tsx src/web/server.ts",

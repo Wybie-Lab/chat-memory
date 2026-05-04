@@ -20,6 +20,7 @@ import {
   graphForFact,
   planAgentRun,
   runCurator,
+  drainPlannedAgentRuns,
   applyAgentRun,
   applyAgentAction,
   rejectAgentAction,
@@ -419,6 +420,22 @@ app.post('/api/curator/actions/:id/reject', (req: Request<{ id: string }>, res: 
     if (!reason) return res.status(400).json({ error: 'reason is required' });
     const action = rejectAgentAction(db, actionId, reason);
     res.json({ action });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Drain queued curator runs (status='planned'). Each run is executed via
+// runCurator; per-run errors are caught so the drainer doesn't abort.
+app.post('/api/curator/drain', async (req: Request, res: Response) => {
+  try {
+    const limit =
+      typeof (req.body as { limit?: unknown })?.limit === 'number' &&
+      (req.body as { limit: number }).limit > 0
+        ? Math.min(Math.floor((req.body as { limit: number }).limit), 25)
+        : undefined;
+    const stats = await drainPlannedAgentRuns(db, provider, { limit });
+    res.json(stats);
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }

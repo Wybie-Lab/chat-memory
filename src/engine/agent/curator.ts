@@ -15,11 +15,17 @@
 
 import {
   countActiveFactsForSubject,
+  countActiveMentionsForEntityExcluding,
   factsAboutSubject,
   getAgentRun,
+  getEntityById,
+  graphForFact,
+  hasInFlightAgentRun,
   incrementAgentRunLlmCalls,
   insertAgentRun,
   listAgentActionsForRun,
+  listFactsMentioningEntity,
+  listPlannedAgentRuns,
   setAgentRunStatus,
   type AgentRunInput,
   type AgentRunRow,
@@ -36,10 +42,10 @@ import type {
   LLMProvider,
 } from '../../llm/provider';
 
-const SYSTEM_PROMPT = `You are a memory curator. You audit a user's long-term memory about one subject and propose targeted improvements.
+const SYSTEM_PROMPT = `You are a memory curator. You audit a slice of long-term memory and propose targeted improvements. The slice is either one SUBJECT (a person — review all facts about them) or one ENTITY (a thing/place/relationship that newly arrived information has resolved or reframed — review facts that mention it).
 
 Your job is NOT to add new facts from scratch — fresh facts arrive through a separate ingestion pipeline. Your job is to clean up what's already there:
-- Update facts that are now better explained by newer context (e.g., a person's name in an old fact is now revealed to refer to a pet, a job, a place — rewrite the old fact to include that resolved context, citing the newer fact as your source).
+- Update facts that are now better explained by newer context (e.g., a name in an old fact is now revealed to refer to a pet, a job, a place — rewrite the old fact to include that resolved context, citing the newer fact as your source).
 - Delete facts that are clearly contradicted or made obsolete by newer facts.
 - Merge near-duplicate facts about the same subject into one canonical fact.
 
@@ -57,6 +63,29 @@ Workflow guidance:
 - Use search_similar_facts when you suspect duplicates you haven't seen yet.
 
 Return tool calls as JSON. The schema is { thinking?: string, tool_calls: [{ name, arguments }] }. You may issue multiple tool calls in one step.`;
+
+// Predicates that "resolve" or "reframe" an entity strongly enough that
+// older facts mentioning it might benefit from re-curation. We deliberately
+// exclude `mentioned` (too generic), `knows` (too generic), and event-flavored
+// predicates (attending/planning/visited/promised_to/needs/likes/dislikes/
+// interested_in) which describe transient state, not identity.
+const TYPE_DEFINING_PREDICATES = new Set<string>([
+  'family_of',
+  'friend_of',
+  'partner_of',
+  'works_at',
+  'studies_at',
+  'lives_in',
+  'from_place',
+  'located_in',
+  'owns',
+  'part_of',
+]);
+
+const ENTITY_TRIGGER_MIN_PRIOR_MENTIONS = 2;
+
+const TRIGGER_BUDGET_OPS = 6;
+const TRIGGER_BUDGET_LLM_CALLS = 6;
 
 export interface PlanAgentRunInput {
   trigger: AgentRunInput['trigger'];
@@ -79,6 +108,97 @@ export function planAgentRun(db: DB, input: PlanAgentRunInput): number {
     budget_ops: input.budget_ops ?? DEFAULT_BUDGET_OPS,
     budget_llm_calls: input.budget_llm_calls ?? DEFAULT_BUDGET_LLM_CALLS,
   });
+}
+
+/**
+ * Inspect a fact's freshly-written graph projection and queue entity-scoped
+ * curator runs for any entity it touches whose prior mentions cross the
+ * threshold and whose predicate is type-defining. Returns the planned run
+ * ids. The pipeline calls this synchronously (cheap — just DB inserts);
+ * actual curator execution happens later via drainPlannedAgentRuns.
+ *
+ * Dedup: if a planned/running run already exists for the same entity, no
+ * new run is queued — the existing one will pick up the latest state when
+ * it drains.
+ */
+export function planTriggeredRunsForFact(db: DB, factId: number): number[] {
+  const graph = graphForFact(db, factId);
+  if (graph.edges.length === 0) return [];
+
+  // Collect candidate entity ids from edges with type-defining predicates.
+  const candidates = new Set<number>();
+  for (const edge of graph.edges) {
+    if (!TYPE_DEFINING_PREDICATES.has(edge.predicate)) continue;
+    candidates.add(edge.source_entity_id);
+    candidates.add(edge.target_entity_id);
+  }
+  if (candidates.size === 0) return [];
+
+  const planned: number[] = [];
+  for (const entityId of candidates) {
+    const priorMentions = countActiveMentionsForEntityExcluding(db, entityId, factId);
+    if (priorMentions < ENTITY_TRIGGER_MIN_PRIOR_MENTIONS) continue;
+    const scopeRef = String(entityId);
+    if (hasInFlightAgentRun(db, 'entity', scopeRef)) continue;
+
+    const runId = planAgentRun(db, {
+      trigger: 'entity_signal',
+      scope_type: 'entity',
+      scope_ref: scopeRef,
+      trigger_fact_id: factId,
+      budget_ops: TRIGGER_BUDGET_OPS,
+      budget_llm_calls: TRIGGER_BUDGET_LLM_CALLS,
+    });
+    planned.push(runId);
+  }
+  return planned;
+}
+
+export interface DrainStats {
+  drained: number;
+  proposed_total: number;
+  errors: string[];
+}
+
+export interface DrainOptions {
+  limit?: number;
+  log?: (line: string) => void;
+}
+
+/**
+ * Process queued curator runs (status='planned'). Each run is executed in
+ * sequence with the standard runCurator loop. Errors per-run are caught so
+ * one bad run doesn't abort the rest. Returns aggregate stats.
+ *
+ * This is intentionally NOT called from the burst pipeline — entity signals
+ * are queued cheaply during ingestion, and the operator (or a cron, or the
+ * web UI) drains them when they're ready to spend the LLM budget.
+ */
+export async function drainPlannedAgentRuns(
+  db: DB,
+  provider: import('../../llm/provider').LLMProvider,
+  opts: DrainOptions = {}
+): Promise<DrainStats> {
+  const log = opts.log ?? (() => {});
+  const limit = opts.limit ?? 5;
+  const stats: DrainStats = { drained: 0, proposed_total: 0, errors: [] };
+  const runs = listPlannedAgentRuns(db, limit);
+  for (const run of runs) {
+    log(
+      `▶ draining run ${run.id} ` +
+        `(${run.trigger}, scope=${run.scope_type}:${run.scope_ref})`
+    );
+    try {
+      const result = await runCurator(db, provider, run.id, { log });
+      stats.drained++;
+      stats.proposed_total += result.proposed_action_count;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      stats.errors.push(`run ${run.id}: ${message}`);
+      log(`  run ${run.id} ERROR: ${message}`);
+    }
+  }
+  return stats;
 }
 
 export interface RunCuratorResult {
@@ -155,23 +275,41 @@ export async function runCurator(
         result: ReturnType<typeof unwrapResult>;
       }> = [];
       let earlyTerminate = false;
+      let pendingFinish: { summary: string | null } | null = null;
+      let nonFinishFailed = false;
 
       for (let i = 0; i < output.tool_calls.length; i++) {
         const call = output.tool_calls[i] as AgentToolCall;
         const result = await dispatchToolCall(ctx, call);
         dispatchResults.push({ index: i, name: call.name, result: unwrapResult(result) });
         log(
-          `  → ${call.name}(${JSON.stringify(call.arguments).slice(0, 200)}) ` +
+          `  → ${call.name}(${JSON.stringify(call.arguments).slice(0, 600)}) ` +
             `ok=${result.ok}` +
             (result.error ? ` error="${result.error}"` : '')
         );
         if (result.finished) {
-          finished = true;
-          finishedSummary = (call.arguments?.summary as string | undefined) ?? null;
+          // Defer the finish decision until we've seen every call this round.
+          // If any non-finish call failed, force a retry instead of letting
+          // the model "fire and forget".
+          pendingFinish = {
+            summary: (call.arguments?.summary as string | undefined) ?? null,
+          };
+        } else if (!result.ok) {
+          nonFinishFailed = true;
         }
         if (result.terminate) {
           earlyTerminate = true;
         }
+      }
+
+      if (pendingFinish && !nonFinishFailed) {
+        finished = true;
+        finishedSummary = pendingFinish.summary;
+      } else if (pendingFinish && nonFinishFailed) {
+        log(
+          '  finish() ignored: a non-finish call in the same batch failed; ' +
+            'agent will retry with the error in history.'
+        );
       }
 
       // Tool results back to the model — one entry per step, capturing every
@@ -241,12 +379,53 @@ function buildInitialUserPrompt(db: DB, run: AgentRunRow): string {
       'Begin your review.',
     ].join('\n');
   }
+
+  // entity scope
+  const entityId = Number(run.scope_ref);
+  const entity = Number.isFinite(entityId) ? getEntityById(db, entityId) : null;
+  const mentions = entity ? listFactsMentioningEntity(db, entityId, 50) : [];
+  const preview = mentions
+    .slice(0, 12)
+    .map(
+      (m) =>
+        `  [${m.id}] subject=${m.subject_wa_id} (${m.category}) ${m.content}` +
+        (m.mention_role ? `   — role=${m.mention_role}${m.mention_text ? ` "${m.mention_text}"` : ''}` : '')
+    )
+    .join('\n');
+
+  // Surface the trigger fact's content directly — without it the agent has
+  // to guess what new info just landed.
+  let triggerFactBlock = '';
+  if (run.trigger_fact_id) {
+    const tf = mentions.find((m) => m.id === run.trigger_fact_id);
+    if (tf) {
+      triggerFactBlock = `Trigger fact: [${tf.id}] (${tf.category}, conf=${tf.confidence.toFixed(2)}) ${tf.content}`;
+    } else {
+      triggerFactBlock = `Trigger fact id: ${run.trigger_fact_id} (not in current mention list — may have been superseded already).`;
+    }
+  }
+
   return [
-    `Run scope: entity_id = ${run.scope_ref}.`,
+    entity
+      ? `Run scope: entity #${entityId} — "${entity.display_name}" (type=${entity.entity_type}).`
+      : `Run scope: entity_id = ${run.scope_ref} (entity row not found).`,
+    `Active facts mentioning this entity: ${mentions.length}.`,
+    triggerFactBlock ||
+      'Trigger: manual review of this entity (no specific trigger fact).',
+    run.trigger_fact_id
+      ? `The trigger fact resolved or reframed this entity. Earlier facts mentioning ${
+          entity?.display_name ?? 'it'
+        } may now read differently in light of it — for example, "took Nico for a walk" is more meaningful once we know Nico is a dog.`
+      : '',
     `Budget: ≤ ${run.budget_ops} proposed actions, ≤ ${run.budget_llm_calls} LLM calls.`,
     '',
-    'Use list_facts_mentioning_entity to enumerate facts that touch this entity, then look for cross-subject inconsistencies or improvements.',
-  ].join('\n');
+    'Mentions (preview — full list available via list_facts_mentioning_entity):',
+    preview || '  (none)',
+    '',
+    'Your task: decide whether any of these earlier facts should be enriched (update with the new context), corrected, or merged. Each proposal must cite the trigger fact (and any others) as justification. If the existing facts are already adequate, finish without proposing changes.',
+  ]
+    .filter((line) => line !== '')
+    .join('\n');
 }
 
 function unwrapResult<T extends { ok: boolean; error?: string; data: Record<string, unknown> }>(
