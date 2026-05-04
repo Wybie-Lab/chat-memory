@@ -10,6 +10,9 @@ import {
   logProcessing,
   listUnprocessedBursts,
   getBurstMessages,
+  listMemoryThreads,
+  createMemoryThread,
+  addFactToThread,
   type ConnectionPredicate,
   type DB,
   type UnprocessedBurst,
@@ -331,7 +334,22 @@ async function processOne(
 
   const affectedClusters = new Set<string>();
   const recordCluster = (subject: string, category: string) => {
-    affectedClusters.add(`${subject} ${category}`);
+    affectedClusters.add(`${subject}|${category}`);
+  };
+
+  // Captured inside writeTx so the thread-assignment stage (post-tx, outside
+  // the transaction) can attach each new fact to a memory_thread. Holds new
+  // facts produced by ADD or CONNECT ops, grouped by subject.
+  interface NewFactRecord {
+    fact_id: number;
+    category: ExtractedFact['category'];
+    content: string;
+    confidence: number;
+  }
+  const newFactsBySubject = new Map<string, NewFactRecord[]>();
+  const recordNewFact = (subject: string, rec: NewFactRecord) => {
+    if (!newFactsBySubject.has(subject)) newFactsBySubject.set(subject, []);
+    newFactsBySubject.get(subject)!.push(rec);
   };
 
   const writeTx = db.transaction(() => {
@@ -349,6 +367,12 @@ async function processOne(
           event_ts: o.fact.event_ts ?? null,
         });
         insertEmbedding(db, factId, e.vector);
+        recordNewFact(o.subject, {
+          fact_id: factId,
+          category: o.fact.category,
+          content: o.fact.content,
+          confidence: o.fact.confidence,
+        });
         if (GRAPH_ENABLED) {
           graphJobs.push({
             fact_id: factId,
@@ -382,6 +406,12 @@ async function processOne(
           event_ts: o.fact.event_ts ?? null,
         });
         insertEmbedding(db, newId, e.vector);
+        recordNewFact(o.subject, {
+          fact_id: newId,
+          category: o.fact.category,
+          content: o.fact.content,
+          confidence: o.fact.confidence,
+        });
         // Append-only: don't supersede or delete the old fact. Record a
         // typed connection from the new fact back to the old one. The old
         // row stays active and discoverable via retrieval; latestInChain()
@@ -465,8 +495,75 @@ async function processOne(
     }
   }
 
+  // Thread assignment: one LLM call per subject in this burst attaches each
+  // new fact to existing memory_threads or creates new ones. Failures here
+  // are logged but don't fail the burst — fact rows are already committed.
+  for (const [subject, newFacts] of newFactsBySubject) {
+    if (newFacts.length === 0) continue;
+    try {
+      const existing = listMemoryThreads(db, { owner_subject_wa_id: subject });
+      const assignmentResult = await provider.assignThreads({
+        subject,
+        contactDisplayName: burst.chat_display_name ?? null,
+        existing: existing.map((t) => ({
+          id: t.id,
+          name: t.name,
+          description: t.description,
+        })),
+        facts: newFacts.map((f) => ({
+          id: f.fact_id,
+          category: f.category,
+          content: f.content,
+          confidence: f.confidence,
+        })),
+      });
+      logProcessing(db, {
+        burst_id: burst.id,
+        stage: 'extract',
+        model: assignmentResult.usage.model + ' [thread-assign]',
+        tokens_in: assignmentResult.usage.tokens_in,
+        tokens_out: assignmentResult.usage.tokens_out,
+      });
+
+      const localToThreadId = new Map<string, number>();
+      for (const t of assignmentResult.result.new_threads) {
+        const id = createMemoryThread(db, {
+          name: t.name,
+          description: t.description ?? null,
+          owner_subject_wa_id: subject,
+        });
+        localToThreadId.set(t.local_id, id);
+      }
+
+      let attachedCount = 0;
+      for (const a of assignmentResult.result.assignments) {
+        const threadIds = new Set<number>(a.existing_thread_ids);
+        for (const localId of a.new_thread_local_ids) {
+          const id = localToThreadId.get(localId);
+          if (id) threadIds.add(id);
+        }
+        for (const tid of threadIds) {
+          if (addFactToThread(db, { fact_id: a.fact_id, thread_id: tid })) {
+            attachedCount++;
+          }
+        }
+      }
+      log(
+        `  burst ${burst.id} THREADS subject=${subject}: ` +
+          `${newFacts.length} fact(s), ${assignmentResult.result.new_threads.length} new thread(s), ` +
+          `${attachedCount} membership(s)`
+      );
+    } catch (err) {
+      log(
+        `  burst ${burst.id} THREADS subject=${subject} ERROR: ${
+          err instanceof Error ? err.message : err
+        }`
+      );
+    }
+  }
+
   for (const key of affectedClusters) {
-    const sep = key.indexOf(' ');
+    const sep = key.indexOf('|');
     const subject = key.slice(0, sep);
     const category = key.slice(sep + 1);
     try {

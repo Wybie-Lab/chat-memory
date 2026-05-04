@@ -11,6 +11,8 @@ import type {
   EmbedMode,
   GraphFactInput,
   SummarizeClusterInput,
+  ThreadAssignInput,
+  ThreadAssignResult,
   UsageMetadata,
 } from './provider';
 
@@ -20,6 +22,7 @@ const EXTRACT_MODEL = process.env.OPENROUTER_EXTRACT_MODEL ?? DEFAULT_OPENROUTER
 const CONSOLIDATE_MODEL = process.env.OPENROUTER_CONSOLIDATE_MODEL ?? DEFAULT_OPENROUTER_MODEL;
 const SUMMARIZE_MODEL = process.env.OPENROUTER_SUMMARIZE_MODEL ?? DEFAULT_OPENROUTER_MODEL;
 const GRAPH_MODEL = process.env.OPENROUTER_GRAPH_MODEL ?? DEFAULT_OPENROUTER_MODEL;
+const THREAD_ASSIGN_MODEL = process.env.OPENROUTER_THREAD_ASSIGN_MODEL ?? DEFAULT_OPENROUTER_MODEL;
 const CHAT_MODEL = process.env.OPENROUTER_CHAT_MODEL ?? DEFAULT_OPENROUTER_MODEL;
 const CURATOR_MODEL = process.env.OPENROUTER_CURATOR_MODEL ?? DEFAULT_OPENROUTER_MODEL;
 const EMBED_MODEL = 'embed-multilingual-v3.0';
@@ -284,6 +287,101 @@ const ConsolidateZod = z.object({
       category: z.enum(FACT_CATEGORIES).optional(),
       confidence: z.number().min(0).max(1).optional(),
       reason: z.string().optional(),
+    })
+  ),
+});
+
+const THREAD_ASSIGN_SYSTEM_PROMPT = `You are organizing newly-extracted facts about ONE person into thematic THREADS. A thread is a topical bucket that groups facts about the same area of someone's life.
+
+Examples of good threads:
+- "Nico (her dog)"            — all facts about a specific pet
+- "career"                     — job, employer, role, title
+- "family"                     — parents, siblings, spouse
+- "health"                     — medical conditions, doctor visits
+- "travel — Italy 2026"        — facts about a specific trip
+- "music tastes"               — genres, artists, concerts they like
+- "cooking habits"             — what they cook, food preferences
+
+Threads are NOT the same as the fact's category (preference / event / commitment / fact / relationship). The category is structural; the thread is topical. A "preference" fact about jazz and an "event" fact about going to a jazz festival can belong to the same "music tastes" thread.
+
+You will be given:
+- The subject these facts are about
+- The list of EXISTING threads for that subject (id + name + description)
+- A batch of new FACTS just extracted
+
+For each fact, decide which thread(s) it belongs to. A fact can belong to MULTIPLE threads (e.g. a fact about a sister's wedding belongs to both "family" and "events 2026"). Always assign every fact to at least one thread — if no existing thread fits, propose a new one.
+
+Output format:
+{
+  "new_threads": [
+    { "local_id": "music", "name": "music tastes", "description": "..." }
+  ],
+  "assignments": [
+    { "fact_id": 201, "existing_thread_ids": [], "new_thread_local_ids": ["music"] },
+    { "fact_id": 202, "existing_thread_ids": [12], "new_thread_local_ids": [] },
+    { "fact_id": 203, "existing_thread_ids": [12, 15], "new_thread_local_ids": [] }
+  ]
+}
+
+Rules:
+- Reuse an existing thread when it covers the fact. Only propose a new thread when none of the existing ones fit.
+- Thread names are short (1–4 words), lowercase, descriptive. Avoid the subject's name in the thread name (it's implicit). Bad: "Emma's career". Good: "career".
+- Description is one short sentence explaining what the thread is for. Optional but recommended.
+- Two facts about the same new topic should reference the SAME local_id in their assignments — define the new thread once, reference it from each fact.
+- Match the language of the source facts for thread names (Italian/English/…).
+- Don't invent threads that have only one possible fact. If only one fact fits a topic, prefer attaching it to a broader existing thread.
+
+Return JSON only.`;
+
+const THREAD_ASSIGN_SCHEMA_JSON = {
+  type: 'object',
+  properties: {
+    new_threads: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          local_id: { type: 'string' },
+          name: { type: 'string' },
+          description: { type: 'string' },
+        },
+        required: ['local_id', 'name'],
+        additionalProperties: false,
+      },
+    },
+    assignments: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          fact_id: { type: 'integer' },
+          existing_thread_ids: { type: 'array', items: { type: 'integer' } },
+          new_thread_local_ids: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['fact_id', 'existing_thread_ids', 'new_thread_local_ids'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['new_threads', 'assignments'],
+  additionalProperties: false,
+} as const;
+
+const ThreadAssignZod = z.object({
+  new_threads: z
+    .array(
+      z.object({
+        local_id: z.string().min(1),
+        name: z.string().min(1),
+        description: z.string().optional(),
+      })
+    )
+    .default([]),
+  assignments: z.array(
+    z.object({
+      fact_id: z.number().int(),
+      existing_thread_ids: z.array(z.number().int()).default([]),
+      new_thread_local_ids: z.array(z.string()).default([]),
     })
   ),
 });
@@ -672,6 +770,33 @@ export class OpenRouterProvider implements LLMProvider {
     };
   }
 
+  async assignThreads(input: ThreadAssignInput) {
+    const result = await callAgent({
+      systemPrompt: THREAD_ASSIGN_SYSTEM_PROMPT,
+      userPrompt: formatThreadAssignMessage(input),
+      model: THREAD_ASSIGN_MODEL,
+      outputSchema: ThreadAssignZod,
+      outputSchemaJson: THREAD_ASSIGN_SCHEMA_JSON as unknown as Record<string, unknown>,
+    });
+    const parsed = ThreadAssignZod.parse(result.structured);
+    const out: ThreadAssignResult = {
+      new_threads: parsed.new_threads.map((t) => ({
+        local_id: t.local_id,
+        name: t.name,
+        description: t.description ?? null,
+      })),
+      assignments: parsed.assignments.map((a) => ({
+        fact_id: a.fact_id,
+        existing_thread_ids: a.existing_thread_ids,
+        new_thread_local_ids: a.new_thread_local_ids,
+      })),
+    };
+    return {
+      result: out,
+      usage: usageOf(THREAD_ASSIGN_MODEL, result),
+    };
+  }
+
   async extractGraphFromFact(input: GraphFactInput) {
     const result = await callText({
       systemPrompt: `${GRAPH_SYSTEM_PROMPT}
@@ -984,6 +1109,37 @@ function formatSummarizeMessage(input: SummarizeClusterInput): string {
     );
   }
   lines.push('', `Write the rolled-up summary for "${subjectLabel}" (${input.category}).`);
+  return lines.join('\n');
+}
+
+function formatThreadAssignMessage(input: ThreadAssignInput): string {
+  const subjectLabel = input.contactDisplayName
+    ? `${input.contactDisplayName} (id: ${input.subject})`
+    : input.subject;
+  const lines = [
+    `Subject: ${subjectLabel}`,
+    '',
+    'Existing threads:',
+  ];
+  if (input.existing.length === 0) {
+    lines.push('  (none — this is the first batch for this subject)');
+  } else {
+    for (const t of input.existing) {
+      lines.push(
+        `  [${t.id}] ${t.name}${t.description ? ` — ${t.description}` : ''}`
+      );
+    }
+  }
+  lines.push('', 'New facts to assign:');
+  for (const f of input.facts) {
+    lines.push(
+      `  [${f.id}] (${f.category}, conf=${f.confidence.toFixed(2)}) ${f.content}`
+    );
+  }
+  lines.push(
+    '',
+    'For each fact, choose existing thread ids and/or define new threads (with local ids). Every fact must end up in at least one thread.'
+  );
   return lines.join('\n');
 }
 
