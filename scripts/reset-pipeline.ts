@@ -6,6 +6,9 @@ async function main() {
   const db = openDb(dbPath);
 
   const facts = db.prepare('SELECT COUNT(*) AS n FROM facts').get() as { n: number };
+  const graphEdges = db
+    .prepare('SELECT COUNT(*) AS n FROM knowledge_edges')
+    .get() as { n: number };
   const embeddings = db
     .prepare('SELECT COUNT(*) AS n FROM fact_embeddings')
     .get() as { n: number };
@@ -18,7 +21,7 @@ async function main() {
   const logs = db.prepare('SELECT COUNT(*) AS n FROM processing_log').get() as { n: number };
 
   console.log(
-    `before: facts=${facts.n} embeddings=${embeddings.n} bursts=${bursts.n} processed_msgs=${processed.n} logs=${logs.n}`
+    `before: facts=${facts.n} graph_edges=${graphEdges.n} embeddings=${embeddings.n} bursts=${bursts.n} processed_msgs=${processed.n} logs=${logs.n}`
   );
 
   // Order matters: raw_messages.burst_id and facts.source_* are FK-tracked,
@@ -26,6 +29,10 @@ async function main() {
   // cluster_summaries reference fact_ids in JSON — they go stale the moment
   // facts are deleted, so wipe them too.
   const wipe = db.transaction(() => {
+    db.exec('DELETE FROM edge_sources;');
+    db.exec('DELETE FROM knowledge_edges;');
+    db.exec('DELETE FROM fact_entity_mentions;');
+    db.exec('DELETE FROM entities;');
     db.exec('DELETE FROM cluster_summaries;');
     db.exec('DELETE FROM facts;');
     db.exec('DELETE FROM fact_embeddings;');

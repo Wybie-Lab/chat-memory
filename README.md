@@ -7,20 +7,20 @@ Personal WhatsApp memory layer. Ingests messages from your WhatsApp, extracts du
 ## How it works
 
 ```
-WhatsApp → raw_messages → conversation bursts → filter (Haiku) → extract (Sonnet) → consolidate → facts + embeddings
-                                                                                                        ↓
-                                                                                          query (CLI / web RAG chat)
+WhatsApp → raw_messages → conversation bursts → filter → extract → consolidate → facts + embeddings
+                                                                                           ↓
+                                                                             query (CLI / web RAG chat)
 ```
 
 - **Burst-level extraction.** A burst = contiguous run of messages with <30 min gaps. Filter and extract run once per burst with full context, not per message.
 - **Consolidation.** New facts are merged against existing memory for the same subject (`ADD` / `UPDATE` / `DELETE` / `DROP`).
 - **Whitelist-only.** Only chats listed in `config/whitelist.json` are ingested. Everything else is dropped at the source.
-- **LLM provider abstraction.** Default is Anthropic (Haiku 4.5 filter, Sonnet 4.6 extract/consolidate/chat) via `@anthropic-ai/claude-agent-sdk`. Embeddings are Cohere `embed-multilingual-v3.0`. The provider interface (`src/llm/provider.ts`) is swappable — a local-LLM backend can be dropped in without touching pipeline code.
+- **LLM provider abstraction.** Default generative provider is OpenRouter through the Vercel AI SDK. Embeddings remain Cohere `embed-multilingual-v3.0` because the current vector index is 1024-dimensional.
 
 ## Requirements
 
 - Node.js 20+
-- An Anthropic account (used via the Claude Agent SDK)
+- An OpenRouter API key
 - A Cohere API key (free tier is fine for personal use)
 
 ## Setup
@@ -29,7 +29,7 @@ WhatsApp → raw_messages → conversation bursts → filter (Haiku) → extract
 npm install
 
 cp .env.example .env
-# fill in ANTHROPIC_API_KEY and COHERE_API_KEY
+# set OPENROUTER_API_KEY, COHERE_API_KEY, and optionally OPENROUTER_MODEL
 
 cp config/whitelist.example.json config/whitelist.json
 # add the contacts you want to remember (wa_id like "393331234567@c.us")
@@ -51,6 +51,11 @@ npm run import-chat -- --file path/to/_chat.txt --wa-id 393331234567@c.us --me "
 # Process queued bursts (filter → extract → consolidate → embed). Idempotent.
 npm run process
 
+# Build/inspect the optional source-backed knowledge graph from active facts.
+npm run rebuild-graph -- --limit 20 --dry-run
+npm run rebuild-graph -- --force
+# Set ENABLE_GRAPH=1 before `npm run process` to write graph rows during normal processing.
+
 # Web UI: chat (RAG), fact browser, and a chat-export uploader.
 npm run web
 # → http://localhost:3000
@@ -58,11 +63,11 @@ npm run web
 
 ## Storage
 
-- `data/memory.db` — SQLite with `sqlite-vec`. Schema in `src/memory/schema.sql`. Holds raw messages, bursts, facts, embeddings, and a processing log.
+- `data/memory.db` — SQLite with `sqlite-vec`. Schema in `src/engine/storage/schema.sql`. Holds raw messages, bursts, facts, embeddings, graph rows, and a processing log.
 - `data/session/` — `whatsapp-web.js` LocalAuth session (lets you skip the QR after the first scan).
 - `config/whitelist.json` — your contacts (gitignored).
 
-All of these are gitignored. Nothing personal ever leaves your machine except the LLM/embedding API calls.
+All of these are gitignored. Fact text is sent to OpenRouter for generation and Cohere for embeddings.
 
 ## License
 

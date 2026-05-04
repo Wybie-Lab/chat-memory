@@ -32,7 +32,7 @@ export interface FactInput {
 export interface ProcessingLogInput {
   msg_id?: number | null;
   burst_id?: number | null;
-  stage: 'filter' | 'extract' | 'embed';
+  stage: 'filter' | 'extract' | 'embed' | 'graph_extract';
   model: string;
   tokens_in: number;
   tokens_out: number;
@@ -1109,4 +1109,517 @@ export function factsAboutSubject(
        LIMIT ?`
     )
     .all(subjectWaId, limit) as ActiveFactRow[];
+}
+
+export interface GraphEntityInput {
+  entity_type: string;
+  canonical_key: string;
+  display_name: string;
+  aliases?: string[];
+  confidence: number;
+}
+
+export interface GraphEntityRow {
+  id: number;
+  entity_type: string;
+  canonical_key: string;
+  display_name: string;
+  aliases: string[];
+  confidence: number;
+  created_at: number;
+  updated_at: number;
+  merged_into_id: number | null;
+}
+
+export interface FactEntityMentionInput {
+  fact_id: number;
+  entity_id: number;
+  role: string;
+  mention_text?: string | null;
+  confidence: number;
+}
+
+export interface FactEntityMentionRow {
+  id: number;
+  fact_id: number;
+  entity_id: number;
+  role: string;
+  mention_text: string | null;
+  confidence: number;
+  created_at: number;
+}
+
+export interface KnowledgeEdgeInput {
+  source_entity_id: number;
+  predicate: string;
+  target_entity_id: number;
+  confidence: number;
+  source_fact_id?: number | null;
+  source_burst_id?: number | null;
+  event_ts?: number | null;
+  valid_from_ts?: number | null;
+  valid_to_ts?: number | null;
+  qualifiers?: Record<string, unknown>;
+}
+
+export interface KnowledgeEdgeRow {
+  id: number;
+  source_entity_id: number;
+  source_display_name: string;
+  source_entity_type: string;
+  predicate: string;
+  target_entity_id: number;
+  target_display_name: string;
+  target_entity_type: string;
+  confidence: number;
+  source_fact_id: number | null;
+  source_burst_id: number | null;
+  extracted_at: number;
+  event_ts: number | null;
+  valid_from_ts: number | null;
+  valid_to_ts: number | null;
+  status: string;
+  superseded_by_edge_id: number | null;
+  deleted_at: number | null;
+  qualifiers: Record<string, unknown>;
+}
+
+export interface GraphFactRow extends ActiveFactRow {
+  source_burst_id: number | null;
+}
+
+export interface GraphBuildStats {
+  entities: number;
+  mentions: number;
+  edges: number;
+}
+
+export function clearGraphTables(db: DB): void {
+  db.transaction(() => {
+    db.exec('DELETE FROM edge_sources;');
+    db.exec('DELETE FROM knowledge_edges;');
+    db.exec('DELETE FROM fact_entity_mentions;');
+    db.exec('DELETE FROM entities;');
+  })();
+}
+
+export function listActiveFactsForGraph(
+  db: DB,
+  opts: { subject?: string; limit?: number } = {}
+): GraphFactRow[] {
+  const where = ['superseded_by_id IS NULL', 'deleted_at IS NULL'];
+  const params: unknown[] = [];
+  if (opts.subject) {
+    where.push('subject_wa_id = ?');
+    params.push(opts.subject);
+  }
+  const limit = opts.limit ?? 1000;
+  params.push(limit);
+  return db
+    .prepare(
+      `SELECT id, subject_wa_id, category, content, confidence, extracted_at, event_ts, source_burst_id
+       FROM facts
+       WHERE ${where.join(' AND ')}
+       ORDER BY id ASC
+       LIMIT ?`
+    )
+    .all(...params) as GraphFactRow[];
+}
+
+export function upsertEntity(db: DB, input: GraphEntityInput): number {
+  const now = Math.floor(Date.now() / 1000);
+  const aliases = JSON.stringify(input.aliases ?? []);
+  db.prepare(
+    `INSERT INTO entities
+       (entity_type, canonical_key, display_name, aliases_json, confidence, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(canonical_key) DO UPDATE SET
+       display_name = CASE
+         WHEN length(excluded.display_name) > length(entities.display_name)
+         THEN excluded.display_name
+         ELSE entities.display_name
+       END,
+       aliases_json = excluded.aliases_json,
+       confidence = MAX(entities.confidence, excluded.confidence),
+       updated_at = excluded.updated_at`
+  ).run(
+    input.entity_type,
+    input.canonical_key,
+    input.display_name,
+    aliases,
+    input.confidence,
+    now,
+    now
+  );
+
+  const row = db
+    .prepare('SELECT id FROM entities WHERE canonical_key = ?')
+    .get(input.canonical_key) as { id: number };
+  return row.id;
+}
+
+export function insertFactEntityMention(db: DB, input: FactEntityMentionInput): number {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO fact_entity_mentions
+       (fact_id, entity_id, role, mention_text, confidence, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(fact_id, entity_id, role) DO UPDATE SET
+       mention_text = COALESCE(excluded.mention_text, fact_entity_mentions.mention_text),
+       confidence = MAX(fact_entity_mentions.confidence, excluded.confidence)`
+  ).run(
+    input.fact_id,
+    input.entity_id,
+    input.role,
+    input.mention_text ?? null,
+    input.confidence,
+    now
+  );
+
+  const row = db
+    .prepare(
+      `SELECT id FROM fact_entity_mentions
+       WHERE fact_id = ? AND entity_id = ? AND role = ?`
+    )
+    .get(input.fact_id, input.entity_id, input.role) as { id: number };
+  return row.id;
+}
+
+export function upsertKnowledgeEdge(db: DB, input: KnowledgeEdgeInput): number {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO knowledge_edges
+       (source_entity_id, predicate, target_entity_id, confidence, source_fact_id, source_burst_id,
+        extracted_at, event_ts, valid_from_ts, valid_to_ts, qualifiers_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(source_entity_id, predicate, target_entity_id) DO UPDATE SET
+       confidence = MAX(knowledge_edges.confidence, excluded.confidence),
+       source_fact_id = COALESCE(knowledge_edges.source_fact_id, excluded.source_fact_id),
+       source_burst_id = COALESCE(knowledge_edges.source_burst_id, excluded.source_burst_id),
+       event_ts = COALESCE(knowledge_edges.event_ts, excluded.event_ts),
+       valid_from_ts = COALESCE(knowledge_edges.valid_from_ts, excluded.valid_from_ts),
+       valid_to_ts = COALESCE(knowledge_edges.valid_to_ts, excluded.valid_to_ts),
+       status = 'active',
+       deleted_at = NULL`
+  ).run(
+    input.source_entity_id,
+    input.predicate,
+    input.target_entity_id,
+    input.confidence,
+    input.source_fact_id ?? null,
+    input.source_burst_id ?? null,
+    now,
+    input.event_ts ?? null,
+    input.valid_from_ts ?? null,
+    input.valid_to_ts ?? null,
+    JSON.stringify(input.qualifiers ?? {})
+  );
+
+  const row = db
+    .prepare(
+      `SELECT id FROM knowledge_edges
+       WHERE source_entity_id = ? AND predicate = ? AND target_entity_id = ?`
+    )
+    .get(input.source_entity_id, input.predicate, input.target_entity_id) as { id: number };
+
+  if (input.source_fact_id !== null && input.source_fact_id !== undefined) {
+    attachEdgeSource(db, {
+      edge_id: row.id,
+      fact_id: input.source_fact_id,
+      burst_id: input.source_burst_id ?? null,
+    });
+  }
+
+  return row.id;
+}
+
+export function attachEdgeSource(
+  db: DB,
+  input: { edge_id: number; fact_id: number; burst_id?: number | null }
+): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT INTO edge_sources (edge_id, fact_id, burst_id, attached_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(edge_id, fact_id) DO UPDATE SET
+       burst_id = COALESCE(excluded.burst_id, edge_sources.burst_id),
+       attached_at = edge_sources.attached_at`
+  ).run(input.edge_id, input.fact_id, input.burst_id ?? null, now);
+}
+
+export function deactivateGraphForFact(db: DB, factId: number, status: 'deleted' | 'superseded'): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare('DELETE FROM fact_entity_mentions WHERE fact_id = ?').run(factId);
+  db.prepare('DELETE FROM edge_sources WHERE fact_id = ?').run(factId);
+  db.prepare(
+    `UPDATE knowledge_edges
+     SET status = ?, deleted_at = ?
+     WHERE source_fact_id = ?
+       AND NOT EXISTS (
+         SELECT 1 FROM edge_sources es WHERE es.edge_id = knowledge_edges.id
+       )`
+  ).run(status, now, factId);
+}
+
+export function graphCounts(db: DB): GraphBuildStats {
+  const entities = db.prepare('SELECT COUNT(*) AS n FROM entities').get() as { n: number };
+  const mentions = db
+    .prepare('SELECT COUNT(*) AS n FROM fact_entity_mentions')
+    .get() as { n: number };
+  const edges = db
+    .prepare("SELECT COUNT(*) AS n FROM knowledge_edges WHERE status = 'active' AND deleted_at IS NULL")
+    .get() as { n: number };
+  return { entities: entities.n, mentions: mentions.n, edges: edges.n };
+}
+
+function rowToGraphEntity(r: {
+  id: number;
+  entity_type: string;
+  canonical_key: string;
+  display_name: string;
+  aliases_json: string;
+  confidence: number;
+  created_at: number;
+  updated_at: number;
+  merged_into_id: number | null;
+}): GraphEntityRow {
+  return {
+    id: r.id,
+    entity_type: r.entity_type,
+    canonical_key: r.canonical_key,
+    display_name: r.display_name,
+    aliases: JSON.parse(r.aliases_json) as string[],
+    confidence: r.confidence,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+    merged_into_id: r.merged_into_id,
+  };
+}
+
+export function searchEntities(db: DB, query: string, limit = 20): GraphEntityRow[] {
+  const rows = db
+    .prepare(
+      `SELECT id, entity_type, canonical_key, display_name, aliases_json, confidence,
+              created_at, updated_at, merged_into_id
+       FROM entities
+       WHERE merged_into_id IS NULL
+         AND (display_name LIKE ? OR canonical_key LIKE ? OR aliases_json LIKE ?)
+       ORDER BY confidence DESC, length(display_name) ASC
+       LIMIT ?`
+    )
+    .all(`%${query}%`, `%${query}%`, `%${query}%`, limit) as Array<Parameters<typeof rowToGraphEntity>[0]>;
+  return rows.map(rowToGraphEntity);
+}
+
+function rowToKnowledgeEdge(r: Omit<KnowledgeEdgeRow, 'qualifiers'> & { qualifiers_json: string }): KnowledgeEdgeRow {
+  return {
+    ...r,
+    qualifiers: JSON.parse(r.qualifiers_json) as Record<string, unknown>,
+  };
+}
+
+export function graphNeighborhood(
+  db: DB,
+  entityId: number,
+  opts: { limit?: number } = {}
+): KnowledgeEdgeRow[] {
+  const limit = opts.limit ?? 100;
+  const rows = db
+    .prepare(
+      `SELECT
+         e.id,
+         e.source_entity_id,
+         s.display_name AS source_display_name,
+         s.entity_type AS source_entity_type,
+         e.predicate,
+         e.target_entity_id,
+         t.display_name AS target_display_name,
+         t.entity_type AS target_entity_type,
+         e.confidence,
+         e.source_fact_id,
+         e.source_burst_id,
+         e.extracted_at,
+         e.event_ts,
+         e.valid_from_ts,
+         e.valid_to_ts,
+         e.status,
+         e.superseded_by_edge_id,
+         e.deleted_at,
+         e.qualifiers_json
+       FROM knowledge_edges e
+       JOIN entities s ON s.id = e.source_entity_id
+       JOIN entities t ON t.id = e.target_entity_id
+       WHERE (e.source_entity_id = ? OR e.target_entity_id = ?)
+         AND e.status = 'active'
+         AND e.deleted_at IS NULL
+       ORDER BY e.confidence DESC, e.id DESC
+       LIMIT ?`
+    )
+    .all(entityId, entityId, limit) as Array<Omit<KnowledgeEdgeRow, 'qualifiers'> & { qualifiers_json: string }>;
+  return rows.map(rowToKnowledgeEdge);
+}
+
+export interface GraphEntityWithStatsRow extends GraphEntityRow {
+  outgoing_edge_count: number;
+  incoming_edge_count: number;
+}
+
+export function listGraphEntitiesWithStats(db: DB, limit = 500): GraphEntityWithStatsRow[] {
+  const rows = db
+    .prepare(
+      `SELECT
+         e.id, e.entity_type, e.canonical_key, e.display_name, e.aliases_json,
+         e.confidence, e.created_at, e.updated_at, e.merged_into_id,
+         COUNT(DISTINCT out_e.id) AS outgoing_edge_count,
+         COUNT(DISTINCT in_e.id) AS incoming_edge_count
+       FROM entities e
+       LEFT JOIN knowledge_edges out_e
+         ON out_e.source_entity_id = e.id
+        AND out_e.status = 'active'
+        AND out_e.deleted_at IS NULL
+       LEFT JOIN knowledge_edges in_e
+         ON in_e.target_entity_id = e.id
+        AND in_e.status = 'active'
+        AND in_e.deleted_at IS NULL
+       WHERE e.merged_into_id IS NULL
+       GROUP BY e.id
+       ORDER BY (COUNT(DISTINCT out_e.id) + COUNT(DISTINCT in_e.id)) DESC,
+                e.confidence DESC,
+                e.display_name ASC
+       LIMIT ?`
+    )
+    .all(limit) as Array<Parameters<typeof rowToGraphEntity>[0] & {
+    outgoing_edge_count: number;
+    incoming_edge_count: number;
+  }>;
+  return rows.map((r) => ({
+    ...rowToGraphEntity(r),
+    outgoing_edge_count: r.outgoing_edge_count,
+    incoming_edge_count: r.incoming_edge_count,
+  }));
+}
+
+export function listKnowledgeEdges(db: DB, limit = 1000): KnowledgeEdgeRow[] {
+  const rows = db
+    .prepare(
+      `SELECT
+         e.id,
+         e.source_entity_id,
+         s.display_name AS source_display_name,
+         s.entity_type AS source_entity_type,
+         e.predicate,
+         e.target_entity_id,
+         t.display_name AS target_display_name,
+         t.entity_type AS target_entity_type,
+         e.confidence,
+         e.source_fact_id,
+         e.source_burst_id,
+         e.extracted_at,
+         e.event_ts,
+         e.valid_from_ts,
+         e.valid_to_ts,
+         e.status,
+         e.superseded_by_edge_id,
+         e.deleted_at,
+         e.qualifiers_json
+       FROM knowledge_edges e
+       JOIN entities s ON s.id = e.source_entity_id
+       JOIN entities t ON t.id = e.target_entity_id
+       WHERE e.status = 'active'
+         AND e.deleted_at IS NULL
+       ORDER BY e.confidence DESC, e.id DESC
+       LIMIT ?`
+    )
+    .all(limit) as Array<Omit<KnowledgeEdgeRow, 'qualifiers'> & { qualifiers_json: string }>;
+  return rows.map(rowToKnowledgeEdge);
+}
+
+export function graphForFact(db: DB, factId: number): {
+  mentions: Array<FactEntityMentionRow & { entity: GraphEntityRow }>;
+  edges: KnowledgeEdgeRow[];
+} {
+  const mentionRows = db
+    .prepare(
+      `SELECT
+         m.id, m.fact_id, m.entity_id, m.role, m.mention_text, m.confidence, m.created_at,
+         e.entity_type, e.canonical_key, e.display_name, e.aliases_json,
+         e.confidence AS entity_confidence, e.created_at AS entity_created_at,
+         e.updated_at, e.merged_into_id
+       FROM fact_entity_mentions m
+       JOIN entities e ON e.id = m.entity_id
+       WHERE m.fact_id = ?
+       ORDER BY m.role, e.display_name`
+    )
+    .all(factId) as Array<{
+    id: number;
+    fact_id: number;
+    entity_id: number;
+    role: string;
+    mention_text: string | null;
+    confidence: number;
+    created_at: number;
+    entity_type: string;
+    canonical_key: string;
+    display_name: string;
+    aliases_json: string;
+    entity_confidence: number;
+    entity_created_at: number;
+    updated_at: number;
+    merged_into_id: number | null;
+  }>;
+
+  const edges = db
+    .prepare(
+      `SELECT
+         e.id,
+         e.source_entity_id,
+         s.display_name AS source_display_name,
+         s.entity_type AS source_entity_type,
+         e.predicate,
+         e.target_entity_id,
+         t.display_name AS target_display_name,
+         t.entity_type AS target_entity_type,
+         e.confidence,
+         e.source_fact_id,
+         e.source_burst_id,
+         e.extracted_at,
+         e.event_ts,
+         e.valid_from_ts,
+         e.valid_to_ts,
+         e.status,
+         e.superseded_by_edge_id,
+         e.deleted_at,
+         e.qualifiers_json
+       FROM knowledge_edges e
+       JOIN entities s ON s.id = e.source_entity_id
+       JOIN entities t ON t.id = e.target_entity_id
+       JOIN edge_sources es ON es.edge_id = e.id
+       WHERE es.fact_id = ?
+       ORDER BY e.predicate, s.display_name, t.display_name`
+    )
+    .all(factId) as Array<Omit<KnowledgeEdgeRow, 'qualifiers'> & { qualifiers_json: string }>;
+
+  return {
+    mentions: mentionRows.map((m) => ({
+      id: m.id,
+      fact_id: m.fact_id,
+      entity_id: m.entity_id,
+      role: m.role,
+      mention_text: m.mention_text,
+      confidence: m.confidence,
+      created_at: m.created_at,
+      entity: rowToGraphEntity({
+        id: m.entity_id,
+        entity_type: m.entity_type,
+        canonical_key: m.canonical_key,
+        display_name: m.display_name,
+        aliases_json: m.aliases_json,
+        confidence: m.entity_confidence,
+        created_at: m.entity_created_at,
+        updated_at: m.updated_at,
+        merged_into_id: m.merged_into_id,
+      }),
+    })),
+    edges: edges.map(rowToKnowledgeEdge),
+  };
 }
