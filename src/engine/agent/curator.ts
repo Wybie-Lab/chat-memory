@@ -1,18 +1,20 @@
 /**
- * Curator agent loop.
+ * Curator agent loop, built on ai-sdk's native tool-calling.
  *
  * `planAgentRun` records intent (creates an `agent_runs` row in 'planned'
- * state). `runCurator` drives the LLM tool-call loop until the agent calls
- * `finish` or hits its budget. Each step the LLM sees the scope, the tool
- * catalog, and the running history of tool calls + results; it returns the
- * next batch of tool calls to dispatch.
+ * state). `runCurator` drives `generateText({ tools, stopWhen })` for that
+ * run: the model picks tools, ai-sdk validates arguments against each tool's
+ * Zod schema, the tool's `execute` runs against the DB (read tools return
+ * data; propose tools insert into `agent_actions`). The loop terminates
+ * when the model responds with text instead of calling another tool, or
+ * when `stepCountIs(budget_llm_calls)` fires.
  *
- * Important: this v1 NEVER mutates `facts`. Proposed actions land in
- * `agent_actions` (status='proposed') for separate review/apply. The whole
- * point of the run is auditability — every action carries a reason, a
- * confidence, and citing_fact_ids.
+ * `runCurator` NEVER mutates `facts` — that's the apply path's job. Every
+ * proposed action carries reason, confidence, citing_fact_ids, and a back-
+ * pointer to its run for the audit trail.
  */
 
+import { generateText, stepCountIs } from 'ai';
 import {
   countActiveFactsForSubject,
   countActiveMentionsForEntityExcluding,
@@ -26,21 +28,15 @@ import {
   listAgentActionsForRun,
   listFactsMentioningEntity,
   listPlannedAgentRuns,
+  logProcessing,
   setAgentRunStatus,
   type AgentRunInput,
   type AgentRunRow,
   type DB,
 } from '../storage/db';
-import {
-  buildToolCatalog,
-  dispatchToolCall,
-  type DispatchContext,
-} from './tools';
-import type {
-  AgentHistoryEntry,
-  AgentToolCall,
-  LLMProvider,
-} from '../../llm/provider';
+import { buildCuratorTools, type CuratorContext, type CuratorToolSet } from './tools';
+import { CURATOR_MODEL_NAME, getCuratorLanguageModel } from '../../llm';
+import type { LLMProvider } from '../../llm/provider';
 
 const SYSTEM_PROMPT = `You are a memory curator. You audit a slice of long-term memory and propose targeted improvements. The slice is either one SUBJECT (a person — review all facts about them) or one ENTITY (a thing/place/relationship that newly arrived information has resolved or reframed — review facts that mention it).
 
@@ -54,15 +50,14 @@ Hard rules:
 - For 'update', the new content must be more accurate or more contextual than the old, and you must cite the fact(s) that support that. Do not paraphrase for style alone.
 - Prefer no action over a weak action. If you're not confident, finish without proposing it.
 - You operate within a budget. When unsure, gather more context first (read tools are cheap; bad proposals are not).
-- Call 'finish' as soon as you've completed your review. The summary should describe what you proposed and why, in 1-3 sentences.
 
 Workflow guidance:
-- Start by listing all facts about the subject (list_facts_for_subject).
+- Start by listing all facts about the subject (list_facts_for_subject) or all mentions for the entity (list_facts_mentioning_entity), then read the trigger fact context already provided in the user prompt.
 - Look for: same person/pet/place mentioned across facts where one fact resolves their identity; pairs of facts that contradict; clusters of near-duplicates.
 - Use get_fact_sources sparingly to disambiguate before proposing — only when the fact text alone is ambiguous.
 - Use search_similar_facts when you suspect duplicates you haven't seen yet.
 
-Return tool calls as JSON. The schema is { thinking?: string, tool_calls: [{ name, arguments }] }. You may issue multiple tool calls in one step.`;
+When you're done, stop calling tools and respond with a short text summary of what you proposed and why (1–3 sentences). If nothing needed changing, say so. Do NOT keep calling read tools after you've already gathered enough context — that wastes budget.`;
 
 // Predicates that "resolve" or "reframe" an entity strongly enough that
 // older facts mentioning it might benefit from re-curation. We deliberately
@@ -229,113 +224,51 @@ export async function runCurator(
 
   setAgentRunStatus(db, runId, 'running');
 
-  const tools = buildToolCatalog(run);
-  const history: AgentHistoryEntry[] = [];
   let seqCounter = 0;
-  const ctx: DispatchContext = {
+  const ctx: CuratorContext = {
     db,
     provider,
     run,
     nextSeq: () => ++seqCounter,
   };
+  const tools = buildCuratorTools(ctx);
 
+  let stepIndex = 0;
   try {
     const userPrompt = buildInitialUserPrompt(db, run);
-    let finished = false;
-    let finishedSummary: string | null = null;
-    let llmCalls = 0;
 
-    while (!finished && llmCalls < run.budget_llm_calls) {
-      const { output, usage: _usage } = await provider.agentStep({
-        systemPrompt: SYSTEM_PROMPT,
-        userPrompt,
-        tools,
-        history,
-      });
-      llmCalls++;
-      incrementAgentRunLlmCalls(db, runId);
+    const result = await generateText({
+      model: getCuratorLanguageModel(),
+      system: SYSTEM_PROMPT,
+      prompt: userPrompt,
+      tools,
+      stopWhen: stepCountIs(run.budget_llm_calls),
+      temperature: 0,
+      maxRetries: 2,
+      onStepFinish: (event) => {
+        stepIndex++;
+        incrementAgentRunLlmCalls(db, runId);
+        logStep(log, run, stepIndex, event);
+        logProcessing(db, {
+          burst_id: null,
+          stage: 'extract',
+          model: CURATOR_MODEL_NAME + ' [curator]',
+          tokens_in: event.usage.inputTokens ?? 0,
+          tokens_out: event.usage.outputTokens ?? 0,
+        });
+      },
+    });
 
-      log(
-        `step ${llmCalls}/${run.budget_llm_calls}` +
-          (output.thinking ? ` thinking="${output.thinking.slice(0, 200)}"` : '')
-      );
-
-      // Echo the assistant's intent into the history for the next round.
-      history.push({
-        role: 'assistant',
-        content: JSON.stringify({
-          thinking: output.thinking,
-          tool_calls: output.tool_calls,
-        }),
-      });
-
-      const dispatchResults: Array<{
-        index: number;
-        name: string;
-        result: ReturnType<typeof unwrapResult>;
-      }> = [];
-      let earlyTerminate = false;
-      let pendingFinish: { summary: string | null } | null = null;
-      let nonFinishFailed = false;
-
-      for (let i = 0; i < output.tool_calls.length; i++) {
-        const call = output.tool_calls[i] as AgentToolCall;
-        const result = await dispatchToolCall(ctx, call);
-        dispatchResults.push({ index: i, name: call.name, result: unwrapResult(result) });
-        log(
-          `  → ${call.name}(${JSON.stringify(call.arguments).slice(0, 600)}) ` +
-            `ok=${result.ok}` +
-            (result.error ? ` error="${result.error}"` : '')
-        );
-        if (result.finished) {
-          // Defer the finish decision until we've seen every call this round.
-          // If any non-finish call failed, force a retry instead of letting
-          // the model "fire and forget".
-          pendingFinish = {
-            summary: (call.arguments?.summary as string | undefined) ?? null,
-          };
-        } else if (!result.ok) {
-          nonFinishFailed = true;
-        }
-        if (result.terminate) {
-          earlyTerminate = true;
-        }
-      }
-
-      if (pendingFinish && !nonFinishFailed) {
-        finished = true;
-        finishedSummary = pendingFinish.summary;
-      } else if (pendingFinish && nonFinishFailed) {
-        log(
-          '  finish() ignored: a non-finish call in the same batch failed; ' +
-            'agent will retry with the error in history.'
-        );
-      }
-
-      // Tool results back to the model — one entry per step, capturing every
-      // dispatched call. Truncated/structured to keep prompts bounded.
-      history.push({
-        role: 'tool',
-        content: JSON.stringify(
-          dispatchResults.map((r) => ({
-            tool: r.name,
-            ok: r.result.ok,
-            error: r.result.error ?? undefined,
-            data: truncateForPrompt(r.result.data),
-          }))
-        ),
-      });
-
-      if (earlyTerminate) break;
-    }
-
-    const actions = listAgentActionsForRun(db, runId);
     const reasoning =
-      finishedSummary ??
-      (finished ? null : `loop ended without finish; budget llm_calls=${llmCalls}/${run.budget_llm_calls}`);
+      result.text.trim() ||
+      `loop ended without a final summary (finishReason=${result.finishReason}, steps=${stepIndex}/${run.budget_llm_calls})`;
     setAgentRunStatus(db, runId, 'proposed', { reasoning });
 
     const finalRun = getAgentRun(db, runId)!;
+    const actions = listAgentActionsForRun(db, runId);
+    log(
+      `● run ${runId} done: steps=${stepIndex}, proposals=${actions.length}, finishReason=${result.finishReason}`
+    );
     return {
       run: finalRun,
       status: finalRun.status,
@@ -357,6 +290,44 @@ export async function runCurator(
       error: finalRun.error,
     };
   }
+}
+
+// `event` is StepResult<CuratorToolSet> from ai-sdk. We use `unknown` here on
+// purpose: bringing the parameterized generic across the engine boundary made
+// tsc OOM during instantiation. The shape we read (text, toolCalls,
+// toolResults) is stable across ai-sdk versions and is narrowed locally.
+function logStep(
+  log: (line: string) => void,
+  run: AgentRunRow,
+  stepIndex: number,
+  event: unknown
+): void {
+  const e = event as {
+    text?: string;
+    toolCalls?: Array<{ toolName: string; toolCallId: string; input: unknown }>;
+    toolResults?: Array<{ toolCallId: string; output?: unknown }>;
+  };
+  log(`step ${stepIndex}/${run.budget_llm_calls}` + (e.text ? ` text="${e.text.slice(0, 200)}"` : ''));
+  for (const call of e.toolCalls ?? []) {
+    const argsPreview = JSON.stringify(call.input).slice(0, 600);
+    const matchingResult = (e.toolResults ?? []).find((r) => r.toolCallId === call.toolCallId);
+    const output = matchingResult?.output;
+    const ok = isOkResult(output);
+    const errorPart =
+      !ok && output && typeof output === 'object' && 'error' in output
+        ? ` error="${(output as { error: unknown }).error}"`
+        : '';
+    log(`  → ${call.toolName}(${argsPreview}) ok=${ok}${errorPart}`);
+  }
+}
+
+function isOkResult(output: unknown): boolean {
+  return (
+    !!output &&
+    typeof output === 'object' &&
+    'ok' in output &&
+    (output as { ok: unknown }).ok === true
+  );
 }
 
 function buildInitialUserPrompt(db: DB, run: AgentRunRow): string {
@@ -428,20 +399,3 @@ function buildInitialUserPrompt(db: DB, run: AgentRunRow): string {
     .join('\n');
 }
 
-function unwrapResult<T extends { ok: boolean; error?: string; data: Record<string, unknown> }>(
-  r: T
-): { ok: boolean; error?: string; data: Record<string, unknown> } {
-  return { ok: r.ok, error: r.error, data: r.data };
-}
-
-const PROMPT_PAYLOAD_CHAR_CAP = 4000;
-
-function truncateForPrompt(data: Record<string, unknown>): Record<string, unknown> {
-  const json = JSON.stringify(data);
-  if (json.length <= PROMPT_PAYLOAD_CHAR_CAP) return data;
-  return {
-    _truncated: true,
-    _original_size: json.length,
-    preview: json.slice(0, PROMPT_PAYLOAD_CHAR_CAP),
-  };
-}
