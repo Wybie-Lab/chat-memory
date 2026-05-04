@@ -1,1 +1,6 @@
-export { createLLMProvider, OpenRouterProvider } from './openrouter';
+export {
+  createLLMProvider,
+  OpenRouterProvider,
+  getCuratorLanguageModel,
+  CURATOR_MODEL_NAME,
+} from './openrouter';
