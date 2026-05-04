@@ -197,9 +197,10 @@
     .typing { color: var(--muted); font-style: italic; }
 
     /* FACTS — subject-centric layout */
-    #facts-view {
+    #facts-view, #threads-view {
       padding: 0; flex-direction: row; min-height: 0;
     }
+    #thread-detail { flex: 1; overflow-y: auto; }
     .subjects-sidebar {
       width: 280px; flex-shrink: 0;
       border-right: 1px solid var(--border);
@@ -376,6 +377,28 @@
       font-size: 12px; color: var(--muted); margin-bottom: 6px;
     }
     .fact-id { color: var(--accent); font-weight: 600; }
+    /* threads view: shared with facts cards but styled inline; minimal extras */
+    .fact-card {
+      padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius);
+      background: var(--panel);
+    }
+    .fact-card .fact-cat {
+      padding: 2px 6px; border-radius: 4px; background: var(--panel-2);
+      text-transform: uppercase; font-size: 10px; letter-spacing: 0.05em; color: var(--muted);
+    }
+    .conn-badge {
+      display: inline-block; padding: 2px 6px; border-radius: 4px;
+      font-size: 11px; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      border: 1px solid var(--border);
+    }
+    .conn-badge.conn-out { color: var(--accent); border-color: var(--accent); }
+    .conn-badge.conn-in  { color: var(--user); border-color: var(--user); }
+    /* threads sidebar list items mirror subjects-sidebar look */
+    #threads-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
+    #threads-list .subject-item.active {
+      background: var(--panel-2); border-left: 2px solid var(--accent);
+    }
+    #threads-list .subject-item:hover:not(.active) { background: var(--panel-2); }
     .fact-category {
       padding: 2px 8px; border-radius: 4px; background: var(--panel-2);
       text-transform: uppercase; font-size: 10px; letter-spacing: 0.05em;
@@ -454,10 +477,26 @@
       display: flex; flex-direction: column; gap: 16px;
     }
     .graph-toolbar {
-      display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
+      display: flex; align-items: center; justify-content: space-between; gap: 16px;
       padding-bottom: 12px; border-bottom: 1px solid var(--border);
     }
     .graph-toolbar h2 { margin: 0; font-size: 22px; font-weight: 600; }
+    .graph-timebar {
+      display: grid; grid-template-columns: auto minmax(180px, 320px) auto auto;
+      gap: 10px; align-items: center; min-width: min(100%, 560px);
+    }
+    .graph-timebar button {
+      background: var(--panel-2); border: 1px solid var(--border);
+      color: var(--fg); border-radius: 6px; padding: 5px 9px;
+      font: inherit; cursor: pointer; min-width: 58px;
+    }
+    .graph-timebar button:hover { border-color: var(--accent); }
+    .graph-timebar button.active { color: var(--accent); border-color: var(--accent); }
+    .graph-timebar input[type="range"] { width: 100%; accent-color: var(--accent); }
+    .graph-time-label {
+      color: var(--muted); font-size: 12px; min-width: 132px;
+      font-variant-numeric: tabular-nums; text-align: right;
+    }
     .graph-canvas {
       height: 520px; min-height: 360px;
       background: var(--panel); border: 1px solid var(--border);
@@ -524,7 +563,12 @@
       #graph-view { flex-direction: column; }
       .graph-sidebar { width: 100%; max-height: 260px; border-right: 0; border-bottom: 1px solid var(--border); }
       .graph-main { padding: 24px 12px; }
-      .graph-toolbar { align-items: flex-start; }
+      .graph-toolbar { align-items: flex-start; flex-direction: column; }
+      .graph-timebar {
+        width: 100%; grid-template-columns: auto minmax(0, 1fr) auto;
+      }
+      #graph-all-time { grid-column: 1 / -1; width: 100%; }
+      .graph-time-label { min-width: 96px; }
       .graph-details { grid-template-columns: 1fr; }
       .graph-canvas { height: 420px; min-height: 320px; }
       .graph-overlay { right: 12px; flex-wrap: wrap; }
@@ -594,6 +638,7 @@
     <nav>
       <button data-view="chat" class="active">Chat</button>
       <button data-view="facts">Facts</button>
+      <button data-view="threads">Threads</button>
       <button data-view="graph">Graph</button>
       <button data-view="import">Import</button>
     </nav>
@@ -632,6 +677,21 @@
       </div>
     </section>
 
+    <section id="threads-view" class="view">
+      <aside class="subjects-sidebar">
+        <input type="text" id="thread-search" placeholder="Search threads..." autocomplete="off" />
+        <ul id="threads-list">
+          <!-- populated by JS -->
+        </ul>
+      </aside>
+      <div id="thread-detail">
+        <div class="empty" style="padding: 60px 24px; text-align: center; color: var(--muted);">
+          <h2 style="margin: 0 0 8px 0; color: var(--fg); font-size: 16px;">Memory threads</h2>
+          <p style="margin: 0; font-size: 13px;">Topical buckets of facts within each subject.<br>Pick a thread on the left to see its facts and connections.</p>
+        </div>
+      </div>
+    </section>
+
     <section id="graph-view" class="view">
       <aside class="graph-sidebar">
         <input type="text" id="graph-search" placeholder="Search entities..." autocomplete="off" />
@@ -645,6 +705,12 @@
       <div class="graph-main">
         <div class="graph-toolbar">
           <h2>Knowledge graph</h2>
+          <div class="graph-timebar">
+            <button type="button" id="graph-play">Play</button>
+            <input type="range" id="graph-time-slider" min="0" max="0" value="0" disabled />
+            <span id="graph-time-label" class="graph-time-label">All time</span>
+            <button type="button" id="graph-all-time" class="active">All time</button>
+          </div>
         </div>
         <div id="graph-canvas" class="graph-canvas"></div>
         <div class="graph-details">
@@ -715,7 +781,7 @@
     const $$ = (sel) => document.querySelectorAll(sel);
 
     // ---- view switching ----
-    const knownViews = new Set(['chat', 'facts', 'graph', 'import']);
+    const knownViews = new Set(['chat', 'facts', 'threads', 'graph', 'import']);
 
     function viewFromHash() {
       const view = window.location.hash.replace(/^#/, '');
@@ -727,8 +793,12 @@
       if (!btn) return;
       $$('nav button').forEach((b) => b.classList.toggle('active', b === btn));
       $$('.view').forEach((v) => v.classList.toggle('active', v.id === view + '-view'));
-      if (view !== 'graph') disposeGraphScene();
+      if (view !== 'graph') {
+        stopGraphPlayback();
+        disposeGraphScene();
+      }
       if (view === 'facts') loadSubjects();
+      if (view === 'threads') loadThreads();
       if (view === 'graph') loadGraph();
       if (view === 'import') loadWhitelistOptions();
       if (updateHash && window.location.hash !== `#${view}`) {
@@ -1417,15 +1487,180 @@
     const graphStatEntitiesEl = $('#graph-stat-entities');
     const graphStatEdgesEl = $('#graph-stat-edges');
     const graphStatMentionsEl = $('#graph-stat-mentions');
+    const graphTimeSliderEl = $('#graph-time-slider');
+    const graphTimeLabelEl = $('#graph-time-label');
+    const graphPlayEl = $('#graph-play');
+    const graphAllTimeEl = $('#graph-all-time');
 
     let graphData = null;
+    let graphTimeline = null;
+    let selectedGraphTime = null;
     let selectedGraphEntityId = null;
     let graphSceneState = null;
+    let graphPlayTimer = null;
 
     graphSearchEl.addEventListener('input', () => {
       renderGraphEntityList();
       renderGraph();
     });
+    graphTimeSliderEl.addEventListener('input', () => {
+      if (!graphTimeline || !graphTimeline.steps.length) return;
+      selectedGraphTime = graphTimeline.steps[Number(graphTimeSliderEl.value)] ?? null;
+      updateGraphTimeControls();
+      updateGraphSceneTimeline();
+    });
+    graphPlayEl.addEventListener('click', () => {
+      if (graphPlayTimer) stopGraphPlayback();
+      else startGraphPlayback();
+    });
+    graphAllTimeEl.addEventListener('click', () => {
+      selectedGraphTime = null;
+      stopGraphPlayback();
+      updateGraphTimeControls();
+      updateGraphSceneTimeline();
+    });
+
+    // ───────── threads (append-only memory: topical buckets) ─────────
+
+    let allThreads = [];
+    let threadFilterText = '';
+    let selectedThreadId = null;
+
+    async function loadThreads() {
+      const listEl = $('#threads-list');
+      listEl.innerHTML = '<li class="muted" style="padding: 8px 12px;">Loading…</li>';
+      try {
+        const r = await fetch('/api/threads');
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'request failed');
+        allThreads = data.threads;
+        renderThreadsList();
+      } catch (err) {
+        listEl.innerHTML = `<li class="muted" style="padding: 8px 12px; color: var(--danger);">Error: ${err.message}</li>`;
+      }
+    }
+
+    function renderThreadsList() {
+      const listEl = $('#threads-list');
+      const q = threadFilterText.trim().toLowerCase();
+      const filtered = q
+        ? allThreads.filter(
+            (t) =>
+              t.name.toLowerCase().includes(q) ||
+              (t.description ?? '').toLowerCase().includes(q) ||
+              (t.owner_subject_wa_id ?? '').toLowerCase().includes(q)
+          )
+        : allThreads;
+      // Group by owner subject for readability
+      const bySubject = new Map();
+      for (const t of filtered) {
+        const k = t.owner_subject_wa_id ?? '(cross-subject)';
+        if (!bySubject.has(k)) bySubject.set(k, []);
+        bySubject.get(k).push(t);
+      }
+      const orderedSubjects = [...bySubject.keys()].sort();
+      const html = [];
+      if (filtered.length === 0) {
+        html.push('<li class="muted" style="padding: 8px 12px;">No threads yet.</li>');
+      }
+      for (const subj of orderedSubjects) {
+        const threads = bySubject.get(subj);
+        threads.sort((a, b) => b.fact_count - a.fact_count);
+        html.push(`<li class="subject-group-label" style="padding: 12px 12px 4px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em;">${escapeHtml(subj)}</li>`);
+        for (const t of threads) {
+          const active = t.id === selectedThreadId ? ' active' : '';
+          html.push(`
+            <li class="subject-item${active}" data-thread-id="${t.id}" style="cursor: pointer; padding: 8px 12px;">
+              <div style="display: flex; align-items: baseline; gap: 8px;">
+                <strong style="flex: 1; font-weight: 500;">${escapeHtml(t.name)}</strong>
+                <span class="muted" style="font-size: 11px;">${t.fact_count}</span>
+              </div>
+              ${t.description ? `<div class="muted" style="font-size: 11px; margin-top: 2px;">${escapeHtml(t.description)}</div>` : ''}
+            </li>
+          `);
+        }
+      }
+      listEl.innerHTML = html.join('');
+      listEl.querySelectorAll('li[data-thread-id]').forEach((li) => {
+        li.addEventListener('click', () => {
+          selectedThreadId = Number(li.dataset.threadId);
+          renderThreadsList();
+          loadThreadDetail(selectedThreadId);
+        });
+      });
+    }
+
+    $('#thread-search').addEventListener('input', (e) => {
+      threadFilterText = e.target.value;
+      renderThreadsList();
+    });
+
+    async function loadThreadDetail(threadId) {
+      const detailEl = $('#thread-detail');
+      detailEl.innerHTML = '<div class="empty" style="padding: 60px 24px; text-align: center; color: var(--muted);"><h2>Loading…</h2></div>';
+      try {
+        const r = await fetch(`/api/threads/${threadId}`);
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'request failed');
+        await renderThreadDetail(data);
+      } catch (err) {
+        detailEl.innerHTML = `<div class="empty" style="padding: 60px 24px; text-align: center; color: var(--danger);">Error: ${escapeHtml(err.message)}</div>`;
+      }
+    }
+
+    async function renderThreadDetail({ thread, facts }) {
+      const detailEl = $('#thread-detail');
+      const owner = thread.owner_subject_wa_id ?? '(cross-subject)';
+      // Fetch connections for each fact in parallel
+      const factsWithConns = await Promise.all(
+        facts.map(async (f) => {
+          try {
+            const r = await fetch(`/api/facts/${f.id}/connections`);
+            const c = await r.json();
+            return { ...f, outgoing: c.outgoing || [], incoming: c.incoming || [] };
+          } catch {
+            return { ...f, outgoing: [], incoming: [] };
+          }
+        })
+      );
+
+      const factsHtml = factsWithConns
+        .map((f) => {
+          const out = f.outgoing
+            .map((c) => `<span class="conn-badge conn-out">→ ${escapeHtml(c.predicate)} fact ${c.to_fact_id}</span>`)
+            .join('');
+          const inc = f.incoming
+            .map((c) => `<span class="conn-badge conn-in">fact ${c.from_fact_id} → ${escapeHtml(c.predicate)} ←</span>`)
+            .join('');
+          const eventTs = f.event_ts
+            ? ` · <span class="muted">${new Date(f.event_ts * 1000).toISOString().slice(0, 10)}</span>`
+            : '';
+          return `
+            <article class="fact-card">
+              <header style="display: flex; gap: 8px; align-items: baseline;">
+                <span class="fact-id">#${f.id}</span>
+                <span class="fact-cat">${escapeHtml(f.category)}</span>
+                <span class="muted" style="font-size: 11px;">conf ${(f.confidence * 100).toFixed(0)}%${eventTs}</span>
+              </header>
+              <p style="margin: 6px 0;">${escapeHtml(f.content)}</p>
+              ${out || inc ? `<div class="conn-row" style="margin-top: 4px; display: flex; gap: 6px; flex-wrap: wrap;">${out}${inc}</div>` : ''}
+            </article>
+          `;
+        })
+        .join('');
+
+      detailEl.innerHTML = `
+        <div style="padding: 18px 24px; border-bottom: 1px solid var(--border);">
+          <div class="muted" style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;">${escapeHtml(owner)} · thread #${thread.id}</div>
+          <h2 style="margin: 4px 0 4px 0; font-size: 18px;">${escapeHtml(thread.name)}</h2>
+          ${thread.description ? `<p class="muted" style="margin: 4px 0 0 0; font-size: 13px;">${escapeHtml(thread.description)}</p>` : ''}
+          <p class="muted" style="margin: 8px 0 0 0; font-size: 11px;">${facts.length} fact(s)</p>
+        </div>
+        <div style="padding: 12px 24px; display: flex; flex-direction: column; gap: 8px;">
+          ${factsHtml || '<div class="muted">No facts in this thread yet.</div>'}
+        </div>
+      `;
+    }
 
     async function loadGraph() {
       graphCanvasEl.innerHTML = '<div class="empty"><h2>Loading graph…</h2></div>';
@@ -1434,9 +1669,11 @@
         const data = await r.json();
         if (!r.ok) throw new Error(data.error || 'request failed');
         graphData = data;
+        graphTimeline = data.timeline || { min_ts: null, max_ts: null, steps: [], total_steps: 0 };
         graphStatEntitiesEl.textContent = data.counts.entities;
         graphStatEdgesEl.textContent = data.counts.edges;
         graphStatMentionsEl.textContent = data.counts.mentions;
+        setupGraphTimeline();
         if (!selectedGraphEntityId && data.entities.length) selectedGraphEntityId = data.entities[0].id;
         renderGraphEntityList();
         renderGraph();
@@ -1445,9 +1682,88 @@
       }
     }
 
+    function setupGraphTimeline() {
+      const steps = graphTimeline?.steps || [];
+      graphTimeSliderEl.disabled = steps.length === 0;
+      graphTimeSliderEl.min = '0';
+      graphTimeSliderEl.max = String(Math.max(steps.length - 1, 0));
+      if (selectedGraphTime !== null && !steps.includes(selectedGraphTime)) {
+        selectedGraphTime = steps.find((ts) => ts >= selectedGraphTime) ?? null;
+      }
+      updateGraphTimeControls();
+    }
+
+    function updateGraphTimeControls() {
+      const steps = graphTimeline?.steps || [];
+      const allTime = selectedGraphTime === null;
+      graphAllTimeEl.classList.toggle('active', allTime);
+      graphTimeLabelEl.textContent = allTime ? 'All time' : formatGraphDate(selectedGraphTime);
+      if (steps.length) {
+        const idx = allTime ? steps.length - 1 : Math.max(0, steps.findIndex((ts) => ts === selectedGraphTime));
+        graphTimeSliderEl.value = String(idx < 0 ? steps.length - 1 : idx);
+      }
+    }
+
+    function startGraphPlayback() {
+      const steps = graphTimeline?.steps || [];
+      if (!steps.length) return;
+      let idx = selectedGraphTime === null ? -1 : steps.findIndex((ts) => ts === selectedGraphTime);
+      if (idx >= steps.length - 1) idx = -1;
+      graphPlayEl.textContent = 'Pause';
+      graphPlayTimer = setInterval(() => {
+        idx++;
+        if (idx >= steps.length) {
+          selectedGraphTime = null;
+          stopGraphPlayback();
+        } else {
+          selectedGraphTime = steps[idx];
+        }
+        updateGraphTimeControls();
+        updateGraphSceneTimeline();
+      }, 850);
+    }
+
+    function stopGraphPlayback() {
+      if (!graphPlayTimer) return;
+      clearInterval(graphPlayTimer);
+      graphPlayTimer = null;
+      graphPlayEl.textContent = 'Play';
+    }
+
+    function graphSnapshot(opts = {}) {
+      if (!graphData) return { counts: { entities: 0, edges: 0, mentions: 0 }, entities: [], edges: [] };
+      const at = selectedGraphTime;
+      const allTime = opts.ignoreTime || at === null;
+      const edges = allTime
+        ? graphData.edges
+        : graphData.edges.filter((edge) => edge.first_seen_ts != null && edge.first_seen_ts <= at);
+      const out = new Map();
+      const incoming = new Map();
+      for (const edge of edges) {
+        out.set(edge.source_entity_id, (out.get(edge.source_entity_id) || 0) + 1);
+        incoming.set(edge.target_entity_id, (incoming.get(edge.target_entity_id) || 0) + 1);
+      }
+      const entities = graphData.entities
+        .filter((entity) => allTime || (entity.first_seen_ts != null && entity.first_seen_ts <= at))
+        .map((entity) => ({
+          ...entity,
+          outgoing_edge_count: out.get(entity.id) || 0,
+          incoming_edge_count: incoming.get(entity.id) || 0,
+        }))
+        .filter((entity) => allTime || entity.outgoing_edge_count || entity.incoming_edge_count);
+      return {
+        counts: {
+          entities: entities.length,
+          edges: edges.length,
+          mentions: graphData.counts.mentions,
+        },
+        entities,
+        edges,
+      };
+    }
+
     function renderGraphEntityList() {
       if (!graphData) return;
-      const q = graphSearchEl.value.trim().toLowerCase();
       graphEntitiesEl.innerHTML = '';
       const entities = filteredGraphEntities();
       if (!entities.length) {
@@ -1477,9 +1793,10 @@
 
     function filteredGraphEntities() {
       if (!graphData) return [];
+      const snapshot = graphSnapshot({ ignoreTime: true });
       const q = graphSearchEl.value.trim().toLowerCase();
-      if (!q) return graphData.entities;
-      return graphData.entities.filter((e) =>
+      if (!q) return snapshot.entities;
+      return snapshot.entities.filter((e) =>
         e.display_name.toLowerCase().includes(q) ||
         e.entity_type.toLowerCase().includes(q) ||
         e.canonical_key.toLowerCase().includes(q)
@@ -1489,11 +1806,15 @@
     async function renderGraph() {
       if (!graphData) return;
       await ensureThree();
+      const snapshot = graphSnapshot({ ignoreTime: true });
       const visibleEntities = filteredGraphEntities().slice(0, 80);
       const visibleIds = new Set(visibleEntities.map((e) => e.id));
-      const selected = graphData.entities.find((e) => e.id === selectedGraphEntityId) || visibleEntities[0] || null;
+      const selected = snapshot.entities.find((e) => e.id === selectedGraphEntityId) || visibleEntities[0] || null;
+      if (selected) selectedGraphEntityId = selected.id;
       if (!selected && visibleEntities.length === 0) {
-        graphCanvasEl.innerHTML = '<div class="empty"><h2>No graph rows yet</h2><p>Run processing with ENABLE_GRAPH=1 or rebuild the graph.</p></div>';
+        graphCanvasEl.innerHTML = selectedGraphTime === null
+          ? '<div class="empty"><h2>No graph rows yet</h2><p>Run processing with ENABLE_GRAPH=1 or rebuild the graph.</p></div>'
+          : '<div class="empty"><h2>No graph rows yet</h2><p>Move the timeline forward.</p></div>';
         graphEdgeListEl.innerHTML = '';
         graphSelectedDetailEl.innerHTML = '';
         return;
@@ -1501,16 +1822,16 @@
       if (selected && !visibleIds.has(selected.id)) visibleIds.add(selected.id);
 
       const focusEdges = selected
-        ? graphData.edges.filter((edge) => edge.source_entity_id === selected.id || edge.target_entity_id === selected.id)
+        ? snapshot.edges.filter((edge) => edge.source_entity_id === selected.id || edge.target_entity_id === selected.id)
         : [];
       for (const edge of focusEdges) {
         visibleIds.add(edge.source_entity_id);
         visibleIds.add(edge.target_entity_id);
       }
 
-      const entities = graphData.entities.filter((e) => visibleIds.has(e.id)).slice(0, 100);
+      const entities = snapshot.entities.filter((e) => visibleIds.has(e.id)).slice(0, 100);
       const ids = new Set(entities.map((e) => e.id));
-      const edges = graphData.edges.filter((edge) => ids.has(edge.source_entity_id) && ids.has(edge.target_entity_id));
+      const edges = snapshot.edges.filter((edge) => ids.has(edge.source_entity_id) && ids.has(edge.target_entity_id));
 
       renderGraph3d(entities, edges, selected?.id ?? null);
       renderGraphEdges(selected, focusEdges.length ? focusEdges : edges.slice(0, 80));
@@ -1575,21 +1896,26 @@
       const positions = computeGraph3dPositions(entities, edges, selectedId);
       const nodeMeshes = [];
       const nodeById = new Map();
+      const labelById = new Map();
       for (const e of entities) {
         const degree = (e.outgoing_edge_count || 0) + (e.incoming_edge_count || 0);
         const radius = e.id === selectedId ? 7 : Math.min(6, 3.5 + degree * 0.55);
         const dim = selectedId && !focusIds.has(e.id);
+        const baseOpacity = dim ? 0.25 : 0.95;
         const material = new THREE.MeshStandardMaterial({
           color: graphColorNumber(e.entity_type),
           roughness: 0.45,
           metalness: 0.08,
           transparent: true,
-          opacity: dim ? 0.25 : 0.95,
+          opacity: baseOpacity,
         });
         const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 24, 16), material);
         const p = positions.get(e.id);
         mesh.position.set(p.x, p.y, p.z);
         mesh.userData.entity = e;
+        mesh.userData.firstSeenTs = e.first_seen_ts;
+        mesh.userData.baseOpacity = baseOpacity;
+        mesh.userData.targetOpacity = baseOpacity;
         scene.add(mesh);
         nodeMeshes.push(mesh);
         nodeById.set(e.id, mesh);
@@ -1598,33 +1924,38 @@
         const label = makeTextSprite(shortLabel(e.display_name, 22), dim ? '#8a8a92' : '#e6e6ea');
         label.position.set(p.x + radius + 2, p.y + radius + 1, p.z);
         label.userData.entity = e;
+        label.userData.firstSeenTs = e.first_seen_ts;
+        label.userData.baseOpacity = dim ? 0.35 : 0.9;
+        label.userData.targetOpacity = label.userData.baseOpacity;
+        label.material.opacity = label.userData.baseOpacity;
         scene.add(label);
+        labelById.set(e.id, label);
       }
 
-      const edgeMaterial = new THREE.LineBasicMaterial({
-        color: 0x4a4a54,
-        transparent: true,
-        opacity: 0.42,
-      });
-      const focusEdgeMaterial = new THREE.LineBasicMaterial({
-        color: 0x6ad0aa,
-        transparent: true,
-        opacity: 0.9,
-      });
+      const edgeLines = [];
       for (const edge of edges) {
         const a = positions.get(edge.source_entity_id);
         const b = positions.get(edge.target_entity_id);
         if (!a || !b) continue;
         const focus = selectedId && (edge.source_entity_id === selectedId || edge.target_entity_id === selectedId);
+        const baseOpacity = selectedId && !focus ? 0.14 : focus ? 0.9 : 0.42;
         const line = new THREE.Line(
           new THREE.BufferGeometry().setFromPoints([
             new THREE.Vector3(a.x, a.y, a.z),
             new THREE.Vector3(b.x, b.y, b.z),
           ]),
-          focus ? focusEdgeMaterial : edgeMaterial
+          new THREE.LineBasicMaterial({
+            color: focus ? 0x6ad0aa : 0x4a4a54,
+            transparent: true,
+            opacity: baseOpacity,
+          })
         );
-        if (selectedId && !focus) line.material.opacity = 0.14;
+        line.userData.edge = edge;
+        line.userData.firstSeenTs = edge.first_seen_ts;
+        line.userData.baseOpacity = baseOpacity;
+        line.userData.targetOpacity = baseOpacity;
         scene.add(line);
+        edgeLines.push(line);
       }
 
       const raycaster = new THREE.Raycaster();
@@ -1636,7 +1967,9 @@
         pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
         pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
         raycaster.setFromCamera(pointer, camera);
-        return raycaster.intersectObjects(nodeMeshes, false)[0]?.object || null;
+        return raycaster
+          .intersectObjects(nodeMeshes.filter((mesh) => mesh.visible && mesh.material.opacity > 0.18), false)[0]
+          ?.object || null;
       }
 
       renderer.domElement.addEventListener('pointermove', (event) => {
@@ -1681,16 +2014,74 @@
       let stopped = false;
       function animate() {
         if (stopped) return;
+        updateGraphSceneTransitions();
         controls.update();
         renderer.render(scene, camera);
         requestAnimationFrame(animate);
       }
       animate();
 
-      graphSceneState = { scene, renderer, controls, resize, stop: () => { stopped = true; } };
+      graphSceneState = {
+        scene,
+        renderer,
+        controls,
+        resize,
+        nodeMeshes,
+        edgeLines,
+        labelById,
+        stop: () => { stopped = true; },
+      };
       if (selectedId && nodeById.has(selectedId)) {
         controls.target.copy(nodeById.get(selectedId).position);
       }
+      updateGraphSceneTimeline({ instant: true });
+    }
+
+    function updateGraphSceneTimeline(opts = {}) {
+      if (!graphSceneState) return;
+      const at = selectedGraphTime;
+      const allTime = at === null;
+      for (const mesh of graphSceneState.nodeMeshes) {
+        setGraphObjectTimelineTarget(mesh, allTime, at, opts.instant);
+      }
+      for (const label of graphSceneState.labelById.values()) {
+        setGraphObjectTimelineTarget(label, allTime, at, opts.instant);
+      }
+      for (const line of graphSceneState.edgeLines) {
+        setGraphObjectTimelineTarget(line, allTime, at, opts.instant);
+      }
+    }
+
+    function setGraphObjectTimelineTarget(obj, allTime, at, instant) {
+      const firstSeenTs = obj.userData.firstSeenTs;
+      const visibleAtTime = allTime || (firstSeenTs != null && firstSeenTs <= at);
+      const target = visibleAtTime ? obj.userData.baseOpacity : 0;
+      obj.userData.targetOpacity = target;
+      if (target > 0) obj.visible = true;
+      if (!instant) return;
+      setGraphObjectOpacity(obj, target);
+      obj.visible = target > 0.01;
+    }
+
+    function updateGraphSceneTransitions() {
+      if (!graphSceneState) return;
+      for (const mesh of graphSceneState.nodeMeshes) updateGraphObjectOpacity(mesh);
+      for (const label of graphSceneState.labelById.values()) updateGraphObjectOpacity(label);
+      for (const line of graphSceneState.edgeLines) updateGraphObjectOpacity(line);
+    }
+
+    function updateGraphObjectOpacity(obj) {
+      const target = obj.userData.targetOpacity ?? obj.userData.baseOpacity ?? 1;
+      const material = obj.material;
+      const current = Array.isArray(material) ? material[0].opacity : material.opacity;
+      const next = Math.abs(target - current) < 0.015 ? target : current + (target - current) * 0.18;
+      setGraphObjectOpacity(obj, next);
+      obj.visible = next > 0.01 || target > 0.01;
+    }
+
+    function setGraphObjectOpacity(obj, opacity) {
+      if (Array.isArray(obj.material)) obj.material.forEach((m) => { m.opacity = opacity; });
+      else obj.material.opacity = opacity;
     }
 
     function disposeGraphScene() {
@@ -1808,8 +2199,17 @@
       item.querySelector('.pred').textContent = `→ ${edge.predicate} →`;
       item.querySelector('.tgt').textContent = edge.target_display_name;
       item.querySelector('.edge-meta').textContent =
-        `${Math.round(edge.confidence * 100)}% · ${edge.source_fact_id ? `[fact:${edge.source_fact_id}]` : 'no fact'} · ${edge.source_entity_type} → ${edge.target_entity_type}`;
+        `${Math.round(edge.confidence * 100)}% · ${formatGraphDate(edge.first_seen_ts)} · ${edge.source_fact_id ? `[fact:${edge.source_fact_id}]` : 'no fact'} · ${edge.source_entity_type} → ${edge.target_entity_type}`;
       return item;
+    }
+
+    function formatGraphDate(ts) {
+      if (!ts) return 'undated';
+      return new Date(ts * 1000).toLocaleDateString(undefined, {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+      });
     }
 
     function graphColor(type) {
