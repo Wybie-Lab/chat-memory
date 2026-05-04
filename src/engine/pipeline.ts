@@ -7,11 +7,8 @@ import {
   markFactDeleted,
   deactivateGraphForFact,
   existingFactsForSubject,
-  activeFactsForCluster,
   countActiveFactsForSubject,
   searchFactsForSubjectByVector,
-  upsertClusterSummary,
-  deleteClusterSummary,
   logProcessing,
   listUnprocessedBursts,
   getBurstMessages,
@@ -20,6 +17,7 @@ import {
   type ActiveFactRow,
 } from './storage/db';
 import { writeExtractedGraph, type GraphFactContext } from './graph';
+import { refreshClusterSummary } from './cluster';
 import type {
   LLMProvider,
   BurstInput,
@@ -50,7 +48,10 @@ export interface ProcessStats {
   errors: number;
 }
 
-const CLUSTER_SUMMARY_MIN_FACTS = 3;
+function ageDays(fact: { extracted_at: number }): number {
+  const now = Math.floor(Date.now() / 1000);
+  return Math.max(0, (now - fact.extracted_at) / 86400);
+}
 
 // Above this many active facts for a subject, the consolidator switches from
 // "send all existing facts to the LLM" to "embed each candidate first, then
@@ -448,7 +449,10 @@ async function processOne(
     const subject = key.slice(0, sep);
     const category = key.slice(sep + 1);
     try {
-      const refreshed = await refreshClusterSummary(db, provider, burst.id, subject, category, log);
+      const refreshed = await refreshClusterSummary(db, provider, subject, category, {
+        burstId: burst.id,
+        log,
+      });
       if (refreshed === 'refreshed') result.clusters_refreshed++;
       else if (refreshed === 'deleted') result.clusters_deleted++;
     } catch (err) {
@@ -506,53 +510,6 @@ async function selectExistingByVectorSim(
   return [...merged.values()];
 }
 
-async function refreshClusterSummary(
-  db: DB,
-  provider: LLMProvider,
-  burstId: number,
-  subject: string,
-  category: string,
-  log: (line: string) => void
-): Promise<'refreshed' | 'deleted' | 'noop'> {
-  const facts = activeFactsForCluster(db, subject, category);
-  if (facts.length < CLUSTER_SUMMARY_MIN_FACTS) {
-    deleteClusterSummary(db, subject, category);
-    return 'deleted';
-  }
-
-  const r = await provider.summarizeCluster({
-    subject,
-    category: category as ExtractedFact['category'],
-    facts: facts.map((f) => ({
-      id: f.id,
-      content: f.content,
-      confidence: f.confidence,
-      age_days: ageDays(f),
-    })),
-  });
-  upsertClusterSummary(db, {
-    subject_wa_id: subject,
-    category,
-    summary: r.summary,
-    fact_ids: facts.map((f) => f.id),
-  });
-  logProcessing(db, {
-    burst_id: burstId,
-    stage: 'extract',
-    model: r.usage.model + ' [summarize]',
-    tokens_in: r.usage.tokens_in,
-    tokens_out: r.usage.tokens_out,
-  });
-  log(
-    `  burst ${burstId} CLUSTER ${subject}/${category} (${facts.length} facts) → ${r.summary.length}c`
-  );
-  return 'refreshed';
-}
-
-function ageDays(fact: ActiveFactRow): number {
-  const now = Math.floor(Date.now() / 1000);
-  return Math.max(0, (now - fact.extracted_at) / 86400);
-}
 
 function resolveOp(
   op: ConsolidationOp,

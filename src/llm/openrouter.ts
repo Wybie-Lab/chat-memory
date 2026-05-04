@@ -3,6 +3,8 @@ import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 import { z } from 'zod';
 import { ENTITY_ROLES, ENTITY_TYPES, GRAPH_PREDICATES } from './provider';
 import type {
+  AgentStepInput,
+  AgentStepOutput,
   LLMProvider,
   BurstInput,
   ChatInput,
@@ -21,6 +23,7 @@ const CONSOLIDATE_MODEL = process.env.OPENROUTER_CONSOLIDATE_MODEL ?? DEFAULT_OP
 const SUMMARIZE_MODEL = process.env.OPENROUTER_SUMMARIZE_MODEL ?? DEFAULT_OPENROUTER_MODEL;
 const GRAPH_MODEL = process.env.OPENROUTER_GRAPH_MODEL ?? DEFAULT_OPENROUTER_MODEL;
 const CHAT_MODEL = process.env.OPENROUTER_CHAT_MODEL ?? DEFAULT_OPENROUTER_MODEL;
+const CURATOR_MODEL = process.env.OPENROUTER_CURATOR_MODEL ?? DEFAULT_OPENROUTER_MODEL;
 const EMBED_MODEL = 'embed-multilingual-v3.0';
 
 const openrouter = createOpenRouter({
@@ -475,6 +478,73 @@ const LooseGraphZod = z.object({
     .default([]),
 });
 
+// ───────────── Curator agent step schema ─────────────
+// Each step the curator returns one of:
+//   - thinking + a batch of tool calls (the loop dispatches them)
+//   - a single 'finish' tool call to end the run with a summary
+// We keep the schema generic over tool name / arguments so the engine owns
+// the tool catalog and dispatch — the LLM layer just produces structured
+// next-step intents.
+
+const AGENT_STEP_SCHEMA_JSON = {
+  type: 'object',
+  properties: {
+    thinking: { type: 'string' },
+    tool_calls: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          arguments: { type: 'object', additionalProperties: true },
+        },
+        required: ['name', 'arguments'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['tool_calls'],
+  additionalProperties: false,
+} as const;
+
+const AgentStepZod = z.object({
+  thinking: z.string().optional(),
+  tool_calls: z
+    .array(
+      z.object({
+        name: z.string().min(1),
+        arguments: z.record(z.unknown()),
+      })
+    )
+    .min(1),
+});
+
+function formatAgentStepPrompt(input: AgentStepInput): string {
+  const parts: string[] = [];
+  parts.push(input.userPrompt.trim());
+  parts.push('');
+  parts.push('Tools available:');
+  for (const tool of input.tools) {
+    parts.push(`- ${tool.name}: ${tool.description}`);
+    parts.push(`  parameters: ${JSON.stringify(tool.parameters)}`);
+  }
+  if (input.history.length > 0) {
+    parts.push('');
+    parts.push('Conversation so far (most recent last):');
+    for (const entry of input.history) {
+      parts.push(`[${entry.role}] ${entry.content}`);
+    }
+  }
+  parts.push('');
+  parts.push(
+    'Decide your next move. Respond with JSON matching the schema: ' +
+      '{ "thinking": "...", "tool_calls": [ { "name": "...", "arguments": { ... } } ] }. ' +
+      'You may issue multiple tool calls in one response. ' +
+      'Call the "finish" tool with { "summary": "..." } when you are done.'
+  );
+  return parts.join('\n');
+}
+
 interface AgentCallResult {
   structured: unknown;
   tokens_in: number;
@@ -714,6 +784,22 @@ Do not wrap it in markdown.`,
         tokens_in: result.tokens_in,
         tokens_out: result.tokens_out,
       },
+    };
+  }
+
+  async agentStep(input: AgentStepInput) {
+    const userPrompt = formatAgentStepPrompt(input);
+    const result = await callAgent({
+      systemPrompt: input.systemPrompt,
+      userPrompt,
+      model: CURATOR_MODEL,
+      outputSchema: AgentStepZod,
+      outputSchemaJson: AGENT_STEP_SCHEMA_JSON as unknown as Record<string, unknown>,
+    });
+    const parsed = AgentStepZod.parse(result.structured) as AgentStepOutput;
+    return {
+      output: parsed,
+      usage: usageOf(CURATOR_MODEL, result),
     };
   }
 }

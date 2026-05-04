@@ -38,6 +38,39 @@ export {
   type GraphWriteResult,
 } from './graph';
 
+// ───────────── curator agent (scoped LLM curation) ─────────────
+// The agent reads existing memory and writes proposed mutations to
+// agent_actions. The apply path turns those proposals into real fact
+// mutations (insertFact + markFactSuperseded / markFactDeleted), refreshes
+// affected cluster summaries, and logs evidence trails via fact_sources.
+export { planAgentRun, runCurator, type RunCuratorResult } from './agent/curator';
+export {
+  applyAgentRun,
+  applyAgentAction,
+  rejectAgentAction,
+  type ApplyAgentRunOptions,
+  type ApplyAgentRunResult,
+  type ApplyAgentActionOptions,
+  type ApplyAgentActionResult,
+} from './agent/apply';
+export {
+  getAgentRun,
+  getAgentAction,
+  listAgentRuns,
+  listAgentActionsForRun,
+  countAgentActionsForRun,
+  type AgentRunInput,
+  type AgentRunRow,
+  type AgentActionInput,
+  type AgentActionRow,
+  type AgentTrigger,
+  type AgentScopeType,
+  type AgentRunStatus,
+  type AgentActionOp,
+  type AgentActionStatus,
+  type ListAgentRunsFilter,
+} from './storage/db';
+
 // ───────────── retrieval (consumers compose memory for a query) ─────────────
 export { composeMemoryBlock } from './retrieval/memory-block';
 export {
