@@ -326,7 +326,8 @@ Output format:
 Rules:
 - Reuse an existing thread when it covers the fact. Only propose a new thread when none of the existing ones fit.
 - Thread names are short (1–4 words), lowercase, descriptive. Avoid the subject's name in the thread name (it's implicit). Bad: "Emma's career". Good: "career".
-- Description is one short sentence explaining what the thread is for. Optional but recommended.
+- Description is one short sentence explaining what the thread is for. Optional but recommended. Do NOT prefix descriptions with the subject's name either — say "career and employment history" not "Emma's career and employment history". The thread is already attached to a subject; repeating the name is noise.
+- When the subject is "me (the user)", threads collect facts about the user themselves. Do NOT call them threads "about <contact_name>" — they're about the user. A thread for facts like "I work on weekends" belongs in a thread named "work schedule" or similar, not "Emma's work schedule".
 - Two facts about the same new topic should reference the SAME local_id in their assignments — define the new thread once, reference it from each fact.
 - Match the language of the source facts for thread names (Italian/English/…).
 - Don't invent threads that have only one possible fact. If only one fact fits a topic, prefer attaching it to a broader existing thread.
@@ -1113,9 +1114,15 @@ function formatSummarizeMessage(input: SummarizeClusterInput): string {
 }
 
 function formatThreadAssignMessage(input: ThreadAssignInput): string {
-  const subjectLabel = input.contactDisplayName
-    ? `${input.contactDisplayName} (id: ${input.subject})`
-    : input.subject;
+  // The contactDisplayName is the chat partner's name — use it ONLY when the
+  // subject is that contact (subject === 'me' means the facts are about the
+  // user themselves; calling those threads "Emma's career" would be wrong).
+  const isMe = input.subject === 'me';
+  const subjectLabel = isMe
+    ? 'me (the user themselves)'
+    : input.contactDisplayName
+      ? `${input.contactDisplayName} (id: ${input.subject})`
+      : input.subject;
   const lines = [
     `Subject: ${subjectLabel}`,
     '',
