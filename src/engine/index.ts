@@ -43,7 +43,15 @@ export {
 // agent_actions. The apply path turns those proposals into real fact
 // mutations (insertFact + markFactSuperseded / markFactDeleted), refreshes
 // affected cluster summaries, and logs evidence trails via fact_sources.
-export { planAgentRun, runCurator, type RunCuratorResult } from './agent/curator';
+export {
+  planAgentRun,
+  runCurator,
+  drainPlannedAgentRuns,
+  planTriggeredRunsForFact,
+  type RunCuratorResult,
+  type DrainStats,
+  type DrainOptions,
+} from './agent/curator';
 export {
   applyAgentRun,
   applyAgentAction,
@@ -104,6 +112,7 @@ export {
   existingFactsForSubject,
   countActiveFactsForSubject,
   insertFact,
+  insertAgentDerivedFact,
   insertEmbedding,
   markFactSuperseded,
   markFactDeleted,

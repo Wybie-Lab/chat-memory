@@ -1433,6 +1433,43 @@ function rowToGraphEntity(r: {
   };
 }
 
+export function getEntityById(db: DB, entityId: number): GraphEntityRow | null {
+  const row = db
+    .prepare(
+      `SELECT id, entity_type, canonical_key, display_name, aliases_json, confidence,
+              created_at, updated_at, merged_into_id
+       FROM entities
+       WHERE id = ?`
+    )
+    .get(entityId) as Parameters<typeof rowToGraphEntity>[0] | undefined;
+  return row ? rowToGraphEntity(row) : null;
+}
+
+/**
+ * Count distinct active facts that mention this entity, excluding one fact id.
+ * Used by the entity-signal trigger: a new fact reveals new info about entity
+ * E; we want to know whether E was already mentioned elsewhere (and thus
+ * whether older facts about E might benefit from re-curation).
+ */
+export function countActiveMentionsForEntityExcluding(
+  db: DB,
+  entityId: number,
+  excludeFactId: number
+): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(DISTINCT m.fact_id) AS n
+       FROM fact_entity_mentions m
+       JOIN facts f ON f.id = m.fact_id
+       WHERE m.entity_id = ?
+         AND m.fact_id != ?
+         AND f.superseded_by_id IS NULL
+         AND f.deleted_at IS NULL`
+    )
+    .get(entityId, excludeFactId) as { n: number };
+  return row.n;
+}
+
 export function searchEntities(db: DB, query: string, limit = 20): GraphEntityRow[] {
   const rows = db
     .prepare(
@@ -1915,6 +1952,46 @@ export function listAgentActionsForRun(db: DB, runId: number): AgentActionRow[] 
     )
     .all(runId) as Parameters<typeof rowToAgentAction>[0][];
   return rows.map(rowToAgentAction);
+}
+
+/**
+ * True iff there's an in-flight (planned or running) curator run for this
+ * scope. Used to dedupe entity-signal triggers — if the previous run for
+ * entity E hasn't been drained yet, don't queue another.
+ */
+export function hasInFlightAgentRun(
+  db: DB,
+  scopeType: AgentScopeType,
+  scopeRef: string
+): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1 AS x
+       FROM agent_runs
+       WHERE scope_type = ? AND scope_ref = ?
+         AND status IN ('planned','running')
+       LIMIT 1`
+    )
+    .get(scopeType, scopeRef) as { x: number } | undefined;
+  return !!row;
+}
+
+/**
+ * Pop up to `limit` planned runs in oldest-first order. Used by the drainer
+ * to process the curator queue.
+ */
+export function listPlannedAgentRuns(db: DB, limit = 5): AgentRunRow[] {
+  return db
+    .prepare(
+      `SELECT id, trigger, scope_type, scope_ref, trigger_fact_id,
+              status, budget_ops, budget_llm_calls, llm_calls_used,
+              reasoning, error, started_at, completed_at, applied_at, approved_by
+       FROM agent_runs
+       WHERE status = 'planned'
+       ORDER BY started_at ASC, id ASC
+       LIMIT ?`
+    )
+    .all(limit) as AgentRunRow[];
 }
 
 export function countAgentActionsForRun(db: DB, runId: number): number {
