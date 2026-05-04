@@ -1961,7 +1961,19 @@ export type AgentRunStatus =
   | 'applied'
   | 'rejected'
   | 'failed';
-export type AgentActionOp = 'update' | 'delete' | 'merge';
+// Curator ops in the append-only model. Replaces the legacy
+// 'update'/'delete'/'merge' triplet from the supersede-based design.
+//   connect       — assert a typed fact_connections edge between two
+//                   already-existing facts. Op-specific args in extra:
+//                     { secondary_fact_id: number, predicate: ConnectionPredicate }
+//                   target_fact_id is the from-fact; secondary is the to-fact.
+//   assign_thread — attach an existing fact to an existing thread.
+//                   target_fact_id is the fact; extra: { thread_id: number }.
+//   create_thread — create a new memory_thread (and optionally attach
+//                   one or more facts to it). target_fact_id may be null
+//                   if no specific anchor fact. extra:
+//                     { name, description?, owner_subject_wa_id?, attached_fact_ids?: number[] }
+export type AgentActionOp = 'connect' | 'assign_thread' | 'create_thread';
 export type AgentActionStatus = 'proposed' | 'applied' | 'rejected' | 'skipped';
 
 export interface AgentRunInput {
@@ -1996,9 +2008,8 @@ export interface AgentActionInput {
   seq: number;
   op: AgentActionOp;
   target_fact_id?: number | null;
-  new_content?: string | null;
-  new_category?: string | null;
-  merge_fact_ids?: number[] | null;
+  /** Op-specific arguments (see AgentActionOp doc for the shape per op). */
+  extra?: Record<string, unknown> | null;
   citing_fact_ids: number[];
   reason: string;
   confidence: number;
@@ -2010,14 +2021,13 @@ export interface AgentActionRow {
   seq: number;
   op: AgentActionOp;
   target_fact_id: number | null;
-  new_content: string | null;
-  new_category: string | null;
-  merge_fact_ids: number[] | null;
+  extra: Record<string, unknown>;
   citing_fact_ids: number[];
   reason: string;
   confidence: number;
   status: AgentActionStatus;
   applied_fact_id: number | null;
+  applied_thread_id: number | null;
   rejected_reason: string | null;
   created_at: number;
   applied_at: number | null;
@@ -2131,19 +2141,17 @@ export function insertAgentAction(db: DB, input: AgentActionInput): number {
   const result = db
     .prepare(
       `INSERT INTO agent_actions
-         (run_id, seq, op, target_fact_id, new_content, new_category,
-          merge_fact_ids_json, citing_fact_ids_json, reason, confidence,
+         (run_id, seq, op, target_fact_id, extra_json,
+          citing_fact_ids_json, reason, confidence,
           status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)`
     )
     .run(
       input.run_id,
       input.seq,
       input.op,
       input.target_fact_id ?? null,
-      input.new_content ?? null,
-      input.new_category ?? null,
-      input.merge_fact_ids ? JSON.stringify(input.merge_fact_ids) : null,
+      input.extra ? JSON.stringify(input.extra) : null,
       JSON.stringify(input.citing_fact_ids),
       input.reason,
       input.confidence,
@@ -2158,14 +2166,13 @@ function rowToAgentAction(r: {
   seq: number;
   op: AgentActionOp;
   target_fact_id: number | null;
-  new_content: string | null;
-  new_category: string | null;
-  merge_fact_ids_json: string | null;
+  extra_json: string | null;
   citing_fact_ids_json: string;
   reason: string;
   confidence: number;
   status: AgentActionStatus;
   applied_fact_id: number | null;
+  applied_thread_id: number | null;
   rejected_reason: string | null;
   created_at: number;
   applied_at: number | null;
@@ -2176,16 +2183,13 @@ function rowToAgentAction(r: {
     seq: r.seq,
     op: r.op,
     target_fact_id: r.target_fact_id,
-    new_content: r.new_content,
-    new_category: r.new_category,
-    merge_fact_ids: r.merge_fact_ids_json
-      ? (JSON.parse(r.merge_fact_ids_json) as number[])
-      : null,
+    extra: r.extra_json ? (JSON.parse(r.extra_json) as Record<string, unknown>) : {},
     citing_fact_ids: JSON.parse(r.citing_fact_ids_json) as number[],
     reason: r.reason,
     confidence: r.confidence,
     status: r.status,
     applied_fact_id: r.applied_fact_id,
+    applied_thread_id: r.applied_thread_id,
     rejected_reason: r.rejected_reason,
     created_at: r.created_at,
     applied_at: r.applied_at,
@@ -2195,9 +2199,10 @@ function rowToAgentAction(r: {
 export function listAgentActionsForRun(db: DB, runId: number): AgentActionRow[] {
   const rows = db
     .prepare(
-      `SELECT id, run_id, seq, op, target_fact_id, new_content, new_category,
-              merge_fact_ids_json, citing_fact_ids_json, reason, confidence,
-              status, applied_fact_id, rejected_reason, created_at, applied_at
+      `SELECT id, run_id, seq, op, target_fact_id, extra_json,
+              citing_fact_ids_json, reason, confidence,
+              status, applied_fact_id, applied_thread_id,
+              rejected_reason, created_at, applied_at
        FROM agent_actions
        WHERE run_id = ?
        ORDER BY seq ASC, id ASC`
@@ -2256,9 +2261,10 @@ export function countAgentActionsForRun(db: DB, runId: number): number {
 export function getAgentAction(db: DB, actionId: number): AgentActionRow | null {
   const row = db
     .prepare(
-      `SELECT id, run_id, seq, op, target_fact_id, new_content, new_category,
-              merge_fact_ids_json, citing_fact_ids_json, reason, confidence,
-              status, applied_fact_id, rejected_reason, created_at, applied_at
+      `SELECT id, run_id, seq, op, target_fact_id, extra_json,
+              citing_fact_ids_json, reason, confidence,
+              status, applied_fact_id, applied_thread_id,
+              rejected_reason, created_at, applied_at
        FROM agent_actions
        WHERE id = ?`
     )
@@ -2269,14 +2275,17 @@ export function getAgentAction(db: DB, actionId: number): AgentActionRow | null 
 export function setAgentActionApplied(
   db: DB,
   actionId: number,
-  appliedFactId: number | null
+  applied: { fact_id?: number | null; thread_id?: number | null } = {}
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
     `UPDATE agent_actions
-       SET status = 'applied', applied_fact_id = ?, applied_at = ?
+       SET status = 'applied',
+           applied_fact_id = ?,
+           applied_thread_id = ?,
+           applied_at = ?
      WHERE id = ?`
-  ).run(appliedFactId, now, actionId);
+  ).run(applied.fact_id ?? null, applied.thread_id ?? null, now, actionId);
 }
 
 export function setAgentActionRejected(

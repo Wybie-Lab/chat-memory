@@ -217,17 +217,24 @@ CREATE TABLE IF NOT EXISTS agent_actions (
   id                   INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id               INTEGER NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
   seq                  INTEGER NOT NULL,    -- order within the run
-  op                   TEXT NOT NULL,       -- 'update' | 'delete' | 'merge'
+  op                   TEXT NOT NULL,       -- 'connect' | 'assign_thread' | 'create_thread'
+                                            -- (legacy values retained for old rows)
   target_fact_id       INTEGER REFERENCES facts(id),
-  new_content          TEXT,
+  new_content          TEXT,                -- (legacy update/merge field; reused as
+                                            -- connect's secondary_fact_id has its own column)
   new_category         TEXT,
-  merge_fact_ids_json  TEXT,                -- for 'merge': source fact ids being collapsed
+  merge_fact_ids_json  TEXT,                -- (legacy merge field)
+  extra_json           TEXT,                -- op-specific args:
+                                            --   connect:        { secondary_fact_id, predicate }
+                                            --   assign_thread:  { thread_id }
+                                            --   create_thread:  { name, description?, owner_subject_wa_id?, attached_fact_ids? }
   citing_fact_ids_json TEXT NOT NULL,       -- ≥1 required, validated at insert time
   reason               TEXT NOT NULL,
   confidence           REAL NOT NULL,
   status               TEXT NOT NULL DEFAULT 'proposed',
                                             -- 'proposed' | 'applied' | 'rejected' | 'skipped'
   applied_fact_id      INTEGER REFERENCES facts(id),
+  applied_thread_id    INTEGER REFERENCES memory_threads(id),
   rejected_reason      TEXT,
   created_at           INTEGER NOT NULL,
   applied_at           INTEGER
