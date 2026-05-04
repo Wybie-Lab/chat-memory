@@ -94,22 +94,22 @@ export {
 // not supersede/delete. Groups are topical buckets (many-to-many).
 export {
   CONNECTION_PREDICATES,
-  createMemoryGroup,
-  getMemoryGroup,
-  listMemoryGroups,
-  addFactToGroup,
-  listFactGroups,
-  listFactsInGroup,
+  createMemoryThread,
+  getMemoryThread,
+  listMemoryThreads,
+  addFactToThread,
+  listFactThreads,
+  listFactsInThread,
   insertFactConnection,
   listConnectionsFromFact,
   listConnectionsToFact,
   latestInChain,
   type ConnectionPredicate,
-  type MemoryGroupRow,
-  type MemoryGroupInput,
+  type MemoryThreadRow,
+  type MemoryThreadInput,
   type FactConnectionRow,
   type FactConnectionInput,
-  type ListMemoryGroupsFilter,
+  type ListMemoryThreadsFilter,
 } from './storage/db';
 
 // ───────────── inspection / browsing (used by web UI + eval scoring) ─────────────

@@ -207,6 +207,52 @@ export type ConsolidationOp =
     }
   | { op: 'DROP'; candidate_index: number; reason: string };
 
+// ───────────── Thread assignment ─────────────
+// One LLM call per (burst, subject) attaches new facts to existing threads or
+// creates new ones. Threads are topical buckets — facts can belong to many.
+
+export interface ExistingThread {
+  id: number;
+  name: string;
+  description: string | null;
+}
+
+export interface ThreadAssignFact {
+  /** Stable id used in the response to refer to this fact. Use the DB fact id. */
+  id: number;
+  category: FactCategory;
+  content: string;
+  confidence: number;
+}
+
+export interface ThreadAssignInput {
+  subject: string;
+  /** Display name if available, else the subject id. */
+  contactDisplayName?: string | null;
+  existing: ExistingThread[];
+  facts: ThreadAssignFact[];
+}
+
+export interface ProposedNewThread {
+  /** Local id used to reference this new thread inside the same response. */
+  local_id: string;
+  name: string;
+  description?: string | null;
+}
+
+export interface ThreadAssignment {
+  fact_id: number;
+  /** Existing thread ids this fact should be attached to. */
+  existing_thread_ids: number[];
+  /** Local ids referencing entries in `new_threads`. */
+  new_thread_local_ids: string[];
+}
+
+export interface ThreadAssignResult {
+  new_threads: ProposedNewThread[];
+  assignments: ThreadAssignment[];
+}
+
 export interface LLMProvider {
   filterBurst(input: BurstInput): Promise<FilterResult & { usage: UsageMetadata }>;
   extractBurst(input: BurstInput): Promise<{ facts: ExtractedFact[]; usage: UsageMetadata }>;
@@ -219,6 +265,9 @@ export interface LLMProvider {
   extractGraphFromFact(
     input: GraphFactInput
   ): Promise<{ graph: ExtractedGraph; usage: UsageMetadata }>;
+  assignThreads(
+    input: ThreadAssignInput
+  ): Promise<{ result: ThreadAssignResult; usage: UsageMetadata }>;
   embed(text: string, mode?: EmbedMode): Promise<{ vector: number[]; usage: UsageMetadata }>;
   chat(input: ChatInput): Promise<{ answer: string; usage: UsageMetadata }>;
 }

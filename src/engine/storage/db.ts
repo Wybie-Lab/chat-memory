@@ -2468,7 +2468,7 @@ export const CONNECTION_PREDICATES = [
 
 export type ConnectionPredicate = (typeof CONNECTION_PREDICATES)[number];
 
-export interface MemoryGroupRow {
+export interface MemoryThreadRow {
   id: number;
   name: string;
   description: string | null;
@@ -2478,7 +2478,7 @@ export interface MemoryGroupRow {
   deleted_at: number | null;
 }
 
-export interface MemoryGroupInput {
+export interface MemoryThreadInput {
   name: string;
   description?: string | null;
   owner_subject_wa_id?: string | null;
@@ -2504,12 +2504,12 @@ export interface FactConnectionInput {
   source_agent_action_id?: number | null;
 }
 
-export function createMemoryGroup(db: DB, input: MemoryGroupInput): number {
+export function createMemoryThread(db: DB, input: MemoryThreadInput): number {
   const now = Math.floor(Date.now() / 1000);
   try {
     const result = db
       .prepare(
-        `INSERT INTO memory_groups (name, description, owner_subject_wa_id, created_at, updated_at)
+        `INSERT INTO memory_threads (name, description, owner_subject_wa_id, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?)`
       )
       .run(
@@ -2525,7 +2525,7 @@ export function createMemoryGroup(db: DB, input: MemoryGroupInput): number {
       // Same (owner, name) already exists — return its id rather than throwing.
       const existing = db
         .prepare(
-          `SELECT id FROM memory_groups
+          `SELECT id FROM memory_threads
            WHERE name = ? AND COALESCE(owner_subject_wa_id, '') = COALESCE(?, '')`
         )
         .get(input.name, input.owner_subject_wa_id ?? null) as
@@ -2537,28 +2537,28 @@ export function createMemoryGroup(db: DB, input: MemoryGroupInput): number {
   }
 }
 
-export function getMemoryGroup(db: DB, groupId: number): MemoryGroupRow | null {
+export function getMemoryThread(db: DB, threadId: number): MemoryThreadRow | null {
   const row = db
     .prepare(
       `SELECT id, name, description, owner_subject_wa_id,
               created_at, updated_at, deleted_at
-       FROM memory_groups
+       FROM memory_threads
        WHERE id = ?`
     )
-    .get(groupId) as MemoryGroupRow | undefined;
+    .get(threadId) as MemoryThreadRow | undefined;
   return row ?? null;
 }
 
-export interface ListMemoryGroupsFilter {
+export interface ListMemoryThreadsFilter {
   owner_subject_wa_id?: string | null;
   /** Default true — exclude soft-deleted groups. */
   active_only?: boolean;
 }
 
-export function listMemoryGroups(
+export function listMemoryThreads(
   db: DB,
-  filter: ListMemoryGroupsFilter = {}
-): MemoryGroupRow[] {
+  filter: ListMemoryThreadsFilter = {}
+): MemoryThreadRow[] {
   const where: string[] = [];
   const params: unknown[] = [];
   if (filter.active_only !== false) {
@@ -2577,23 +2577,23 @@ export function listMemoryGroups(
     .prepare(
       `SELECT id, name, description, owner_subject_wa_id,
               created_at, updated_at, deleted_at
-       FROM memory_groups
+       FROM memory_threads
        ${clause}
        ORDER BY id ASC`
     )
-    .all(...params) as MemoryGroupRow[];
+    .all(...params) as MemoryThreadRow[];
 }
 
-export function addFactToGroup(
+export function addFactToThread(
   db: DB,
-  args: { fact_id: number; group_id: number; source_agent_action_id?: number | null }
+  args: { fact_id: number; thread_id: number; source_agent_action_id?: number | null }
 ): boolean {
   const now = Math.floor(Date.now() / 1000);
   try {
     db.prepare(
-      `INSERT INTO fact_group_membership (fact_id, group_id, attached_at, source_agent_action_id)
+      `INSERT INTO fact_thread_membership (fact_id, thread_id, attached_at, source_agent_action_id)
        VALUES (?, ?, ?, ?)`
-    ).run(args.fact_id, args.group_id, now, args.source_agent_action_id ?? null);
+    ).run(args.fact_id, args.thread_id, now, args.source_agent_action_id ?? null);
     return true;
   } catch (err: unknown) {
     if (err instanceof Error && err.message.includes('UNIQUE')) {
@@ -2604,34 +2604,34 @@ export function addFactToGroup(
   }
 }
 
-export function listFactGroups(db: DB, factId: number): MemoryGroupRow[] {
+export function listFactThreads(db: DB, factId: number): MemoryThreadRow[] {
   return db
     .prepare(
       `SELECT g.id, g.name, g.description, g.owner_subject_wa_id,
               g.created_at, g.updated_at, g.deleted_at
-       FROM fact_group_membership m
-       JOIN memory_groups g ON g.id = m.group_id
+       FROM fact_thread_membership m
+       JOIN memory_threads g ON g.id = m.thread_id
        WHERE m.fact_id = ?
          AND g.deleted_at IS NULL
        ORDER BY m.attached_at ASC`
     )
-    .all(factId) as MemoryGroupRow[];
+    .all(factId) as MemoryThreadRow[];
 }
 
-export function listFactsInGroup(db: DB, groupId: number, limit = 200): ActiveFactRow[] {
+export function listFactsInThread(db: DB, threadId: number, limit = 200): ActiveFactRow[] {
   return db
     .prepare(
       `SELECT f.id, f.subject_wa_id, f.category, f.content, f.confidence,
               f.extracted_at, f.event_ts
-       FROM fact_group_membership m
+       FROM fact_thread_membership m
        JOIN facts f ON f.id = m.fact_id
-       WHERE m.group_id = ?
+       WHERE m.thread_id = ?
          AND f.superseded_by_id IS NULL
          AND f.deleted_at IS NULL
        ORDER BY f.extracted_at DESC, f.id DESC
        LIMIT ?`
     )
-    .all(groupId, limit) as ActiveFactRow[];
+    .all(threadId, limit) as ActiveFactRow[];
 }
 
 export function insertFactConnection(db: DB, input: FactConnectionInput): number {

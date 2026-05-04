@@ -241,12 +241,12 @@ CREATE INDEX IF NOT EXISTS idx_agent_actions_status ON agent_actions(status);
 -- superseded_by_id / deleted_at, every change is a new fact + a typed
 -- fact_connections row pointing back to what it modifies. Groups are
 -- topical buckets ("Emma — animals", "Emma — jobs") that facts attach
--- to via fact_group_membership (many-to-many).
+-- to via fact_thread_membership (many-to-many).
 
 -- Topical buckets. owner_subject_wa_id is optional — most groups will be
 -- per-subject ("Emma — animals"), but cross-subject groups are allowed
 -- (e.g. "shared trips").
-CREATE TABLE IF NOT EXISTS memory_groups (
+CREATE TABLE IF NOT EXISTS memory_threads (
   id                    INTEGER PRIMARY KEY AUTOINCREMENT,
   name                  TEXT NOT NULL,
   description           TEXT,
@@ -259,20 +259,20 @@ CREATE TABLE IF NOT EXISTS memory_groups (
   UNIQUE(owner_subject_wa_id, name)
 );
 
-CREATE INDEX IF NOT EXISTS idx_memory_groups_owner ON memory_groups(owner_subject_wa_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_memory_threads_owner ON memory_threads(owner_subject_wa_id) WHERE deleted_at IS NULL;
 
 -- Many-to-many: a fact can sit in multiple groups (e.g. an event involving
 -- two people might belong to both "Emma — events" and "shared trips").
-CREATE TABLE IF NOT EXISTS fact_group_membership (
+CREATE TABLE IF NOT EXISTS fact_thread_membership (
   fact_id                  INTEGER NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
-  group_id                 INTEGER NOT NULL REFERENCES memory_groups(id) ON DELETE CASCADE,
+  thread_id                INTEGER NOT NULL REFERENCES memory_threads(id) ON DELETE CASCADE,
   attached_at              INTEGER NOT NULL,
   source_agent_action_id   INTEGER REFERENCES agent_actions(id),
-  PRIMARY KEY(fact_id, group_id)
+  PRIMARY KEY(fact_id, thread_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_fgm_group ON fact_group_membership(group_id);
-CREATE INDEX IF NOT EXISTS idx_fgm_fact ON fact_group_membership(fact_id);
+CREATE INDEX IF NOT EXISTS idx_ftm_thread ON fact_thread_membership(thread_id);
+CREATE INDEX IF NOT EXISTS idx_ftm_fact ON fact_thread_membership(fact_id);
 
 -- Typed directed edges between facts. The new fact (from_fact_id) modifies
 -- or relates to the older fact (to_fact_id) via `predicate`. Closed enum
