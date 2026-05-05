@@ -1,6 +1,6 @@
 # Why I made my chat memory append-only
 
-I've been building a long-term memory system for personal chat. The idea is simple: read every message, extract durable facts about the people you talk to, store them, query them later. *"What did Alex tell me about her job?"* — that kind of thing.
+I've been building **Chat Memory** — a long-term memory layer for personal conversation. The idea is simple: read every message, extract durable facts about the people you talk to, store them, query them later. *"What did Alex tell me about her job?"* — that kind of thing. Source-agnostic by design: anything that produces a `(contact, message, timestamp, direction)` tuple can feed it.
 
 Most of my early design choices were obvious, copied from a hundred other LLM-memory systems. One choice surprised me. It's the one I want to write about.
 
@@ -94,17 +94,30 @@ I wanted an agent I'd actually let run autonomously. Destructive primitives didn
 
 I started over. What if facts were immutable? You write them once. They never get modified. They never get marked deleted. They just exist.
 
-Then how do you handle Rex dying? You add a *new* fact and connect it to the old one with a typed edge:
+Then how do you handle Rex dying? You add a *new* fact and connect it to the old one with a typed edge. Side by side with what the old design did:
 
-```
-fact 22: Alex has a dog named Rex.    [stays active]
-                  ↑
-                  | predicate = state_change
-                  |
-fact 47: Rex passed away last week.   [stays active]
+```mermaid
+flowchart LR
+    subgraph SUP["supersede / soft-delete (before)"]
+      direction TB
+      OldA["fact 22<br/>'Alex has a dog Rex'<br/><i>superseded_by_id = 47</i>"]
+      OldB["fact 47<br/>'Rex passed away'"]
+      OldA -. tombstone .-> OldB
+    end
+    subgraph AOL["append-only (after)"]
+      direction TB
+      NewA["fact 22<br/>'Alex has a dog Rex'<br/><b>still active</b>"]
+      NewB["fact 47<br/>'Rex passed away'<br/><b>still active</b>"]
+      NewB -- "predicate=state_change<br/>reason='Rex died' " --> NewA
+    end
+
+    classDef inactive fill:#2d2222,stroke:#6e3f3f,color:#a3a3a3
+    classDef active fill:#1f2233,stroke:#4a5568,color:#e6e6ea
+    class OldA inactive
+    class OldB,NewA,NewB active
 ```
 
-Both rows persist. The connection captures *how* they relate.
+Same two facts. Same data going in. The difference is what happens to the past — the supersede design treats it as garbage, the append-only design treats it as evidence.
 
 Schema-wise, the change is small:
 
@@ -155,14 +168,59 @@ Three things fell out of this design that I wasn't expecting.
 
 **You can ask history questions.** *"Did Alex have a dog last March?"* Just look at fact 22 — it was active in March, never retracted, no contradicting edge before March. Yes. The naive system can't answer this. The supersede system technically can but you have to query the tombstone column. With append-only the question becomes a regular query.
 
+Picture how a single piece of memory ages over months. Three different points in time, three different facts, but **none of the earlier rows ever gets touched**:
+
+```mermaid
+flowchart TB
+  subgraph t0["t0 — first mention"]
+    A["fact 12<br/>'Alex has a pet'"]
+  end
+  subgraph t1["t1 — more detail"]
+    A2["fact 12<br/>'Alex has a pet'"]
+    B["fact 14<br/>'Alex has a dog Rex'"]
+    B -- expands --> A2
+  end
+  subgraph t2["t2 — months later"]
+    A3["fact 12<br/>'Alex has a pet'"]
+    B3["fact 14<br/>'Alex has a dog Rex'"]
+    C["fact 47<br/>'Rex passed away'"]
+    B3 -- expands --> A3
+    C -- state_change --> B3
+  end
+
+  t0 --> t1 --> t2
+
+  classDef f fill:#1f2233,stroke:#4a5568,color:#e6e6ea
+  class A,A2,A3,B,B3,C f
+```
+
+A query at t2 can ask "did Alex ever have a dog?" (yes — fact 14), "what's the latest about Rex?" (`latestInChain(14)` → fact 47), or "what's Alex's pet history?" (walk the chain). Three different questions, one append-only graph, every row still there.
+
 **Provenance is automatic.** Every connection has a `reason` column and a `source_agent_action_id` back-pointer. You can ask the database *"why did fact 47 get connected to fact 22?"* and get a real answer. *"The new fact establishes that Rex passed away, providing a discrete state change to the existing fact about Alex's dog."* That comes from the connection's reason. With supersede, you'd have to log it separately or lose it.
 
 **The agent gets safer.** This is the one I cared most about. Once you commit to immutability, the agent's tool catalog changes shape:
 
-```
-propose_connect(from_fact_id, to_fact_id, predicate, reason, confidence)
-propose_assign_thread(fact_id, thread_id, reason)
-propose_create_thread(name, attached_fact_ids, reason)
+```mermaid
+flowchart LR
+    subgraph BEFORE["Before — destructive primitives"]
+      direction TB
+      U["propose_update<br/>(old_id, new_content)"]
+      D["propose_delete<br/>(target_id)"]
+      M["propose_merge<br/>(fact_ids[], canonical)"]
+    end
+    subgraph AFTER["After — additive primitives only"]
+      direction TB
+      C["propose_connect<br/>(from, to, predicate, reason)"]
+      AT["propose_assign_thread<br/>(fact_id, thread_id)"]
+      CT["propose_create_thread<br/>(name, attached_facts[])"]
+    end
+
+    BEFORE -.->|"redesign"| AFTER
+
+    classDef bad fill:#3d1f1f,stroke:#8a3f3f,color:#e6c7c7
+    classDef good fill:#1f3d2d,stroke:#3f8a5a,color:#c7e6d3
+    class U,D,M bad
+    class C,AT,CT good
 ```
 
 Notice what's missing. There's no `propose_update`, no `propose_delete`, no `propose_merge`. The agent literally cannot destroy memory. The worst case for a bad LLM call is a wrong edge — which is just another row you can ignore at read time, or delete from `fact_connections` later.
@@ -207,4 +265,4 @@ Your future self — and your future agents — will be able to ask better quest
 
 ---
 
-*The system this post is about is open-source: [Wybie-Lab/chat-memory](https://github.com/Wybie-Lab/chat-memory). The full data model lives in [`src/engine/storage/schema.sql`](https://github.com/Wybie-Lab/chat-memory/blob/master/src/engine/storage/schema.sql); the technical reference is [`src/engine/README.md`](https://github.com/Wybie-Lab/chat-memory/blob/master/src/engine/README.md).*
+*Chat Memory is open-source: [github.com/Wybie-Lab/chat-memory](https://github.com/Wybie-Lab/chat-memory). The full data model lives in [`src/engine/storage/schema.sql`](https://github.com/Wybie-Lab/chat-memory/blob/master/src/engine/storage/schema.sql); the technical reference, with every table and the full architecture, is in [`src/engine/README.md`](https://github.com/Wybie-Lab/chat-memory/blob/master/src/engine/README.md).*
