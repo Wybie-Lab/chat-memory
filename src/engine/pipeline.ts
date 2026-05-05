@@ -21,6 +21,7 @@ import {
 import { writeExtractedGraph, type GraphFactContext } from './graph';
 import { refreshClusterSummary } from './cluster';
 import { planTriggeredRunsForFact } from './agent/curator';
+import { mapWithConcurrency } from './concurrency';
 import type {
   LLMProvider,
   BurstInput,
@@ -63,6 +64,10 @@ function ageDays(fact: { extracted_at: number }): number {
 const CONSOLIDATION_FULL_LIST_THRESHOLD = 30;
 const CONSOLIDATION_SIMILAR_PER_CANDIDATE = 12;
 const GRAPH_ENABLED = process.env.ENABLE_GRAPH === '1';
+
+// Max in-flight LLM/embed calls per parallel stage in processOne. Bounded so
+// we don't fan out to N requests at once and trip provider rate limits.
+const LLM_CONCURRENCY = 5;
 
 function emptyStats(scanned = 0): ProcessStats {
   return {
@@ -239,72 +244,94 @@ async function processOne(
     { vector: number[]; usage: { model: string; tokens_in: number; tokens_out: number } }
   >();
 
-  for (const [subjectKey, candidates] of groups) {
-    const subjectStored = subjectKey;
+  // Each subject group is independent at the LLM-prompt level — consolidate
+  // only sees one subject's existing+candidate facts. Run them with bounded
+  // concurrency, then merge results into shared state in input order so the
+  // ops stream and oldFactCluster map are deterministic across runs.
+  const subjectGroups = [...groups.entries()];
+  const groupResults = await mapWithConcurrency(
+    subjectGroups,
+    LLM_CONCURRENCY,
+    async ([subjectKey, candidates]) => {
+      const subjectStored = subjectKey;
+      const localOps: ResolvedOp[] = [];
+      const localOldFactCluster: Array<[number, { subject: string; category: string }]> = [];
 
-    const activeCount = countActiveFactsForSubject(db, subjectKey);
-    let existing: ActiveFactRow[];
+      const activeCount = countActiveFactsForSubject(db, subjectKey);
 
-    if (activeCount === 0) {
-      for (const c of candidates) ops.push({ kind: 'add', subject: subjectStored, fact: c });
-      continue;
-    } else if (activeCount <= CONSOLIDATION_FULL_LIST_THRESHOLD) {
-      existing = existingFactsForSubject(db, subjectKey);
-    } else {
-      existing = await selectExistingByVectorSim(
-        db,
-        provider,
-        subjectKey,
-        candidates,
-        precomputedEmbeddings,
-        burst.id,
-        log
-      );
-      // Vector search may return zero rows for very off-topic candidates;
-      // fall back to recency so the LLM has *something* to compare against.
-      if (existing.length === 0) {
+      if (activeCount === 0) {
+        for (const c of candidates) localOps.push({ kind: 'add', subject: subjectStored, fact: c });
+        return { ops: localOps, oldFactClusterEntries: localOldFactCluster };
+      }
+
+      let existing: ActiveFactRow[];
+      if (activeCount <= CONSOLIDATION_FULL_LIST_THRESHOLD) {
         existing = existingFactsForSubject(db, subjectKey);
-      }
-    }
-
-    for (const e of existing) {
-      oldFactCluster.set(e.id, { subject: e.subject_wa_id, category: e.category });
-    }
-
-    const consolidateInput: ConsolidateInput = {
-      subject: subjectStored,
-      existing: existing.map((e) => ({
-        id: e.id,
-        content: e.content,
-        category: e.category,
-        confidence: e.confidence,
-        age_days: ageDays(e),
-      })),
-      candidates,
-    };
-
-    const consolidation = await provider.consolidate(consolidateInput);
-    logProcessing(db, {
-      burst_id: burst.id,
-      stage: 'extract',
-      model: consolidation.usage.model + ' [consolidate]',
-      tokens_in: consolidation.usage.tokens_in,
-      tokens_out: consolidation.usage.tokens_out,
-    });
-
-    const consumedCandidates = new Set<number>();
-    for (const op of consolidation.ops) {
-      const resolved = resolveOp(op, candidates, subjectStored, consumedCandidates, log, burst.id);
-      if (resolved) ops.push(resolved);
-    }
-    for (let i = 0; i < candidates.length; i++) {
-      if (!consumedCandidates.has(i)) {
-        log(
-          `  burst ${burst.id} CONSOLIDATE skipped candidate ${i} ("${candidates[i].content}") — defaulting to ADD`
+      } else {
+        existing = await selectExistingByVectorSim(
+          db,
+          provider,
+          subjectKey,
+          candidates,
+          precomputedEmbeddings,
+          burst.id,
+          log
         );
-        ops.push({ kind: 'add', subject: subjectStored, fact: candidates[i] });
+        // Vector search may return zero rows for very off-topic candidates;
+        // fall back to recency so the LLM has *something* to compare against.
+        if (existing.length === 0) {
+          existing = existingFactsForSubject(db, subjectKey);
+        }
       }
+
+      for (const e of existing) {
+        localOldFactCluster.push([e.id, { subject: e.subject_wa_id, category: e.category }]);
+      }
+
+      const consolidateInput: ConsolidateInput = {
+        subject: subjectStored,
+        existing: existing.map((e) => ({
+          id: e.id,
+          content: e.content,
+          category: e.category,
+          confidence: e.confidence,
+          age_days: ageDays(e),
+        })),
+        candidates,
+      };
+
+      const consolidation = await provider.consolidate(consolidateInput);
+      logProcessing(db, {
+        burst_id: burst.id,
+        stage: 'extract',
+        model: consolidation.usage.model + ' [consolidate]',
+        tokens_in: consolidation.usage.tokens_in,
+        tokens_out: consolidation.usage.tokens_out,
+      });
+
+      const consumedCandidates = new Set<number>();
+      for (const op of consolidation.ops) {
+        const resolved = resolveOp(op, candidates, subjectStored, consumedCandidates, log, burst.id);
+        if (resolved) localOps.push(resolved);
+      }
+      for (let i = 0; i < candidates.length; i++) {
+        if (!consumedCandidates.has(i)) {
+          log(
+            `  burst ${burst.id} CONSOLIDATE skipped candidate ${i} ("${candidates[i].content}") — defaulting to ADD`
+          );
+          localOps.push({ kind: 'add', subject: subjectStored, fact: candidates[i] });
+        }
+      }
+
+      return { ops: localOps, oldFactClusterEntries: localOldFactCluster };
     }
+  );
+
+  for (const r of groupResults) {
+    for (const [id, val] of r.oldFactClusterEntries) {
+      oldFactCluster.set(id, val);
+    }
+    ops.push(...r.ops);
   }
 
   const toEmbed = ops.filter(
@@ -312,14 +339,17 @@ async function processOne(
       o.kind === 'add' || o.kind === 'connect'
   );
   const embedded = new Map<ResolvedOp, { vector: number[]; usage: { model: string; tokens_in: number; tokens_out: number } }>();
+  const needsEmbed: typeof toEmbed = [];
   for (const o of toEmbed) {
     const reused = precomputedEmbeddings.get(o.fact);
-    if (reused) {
-      embedded.set(o, reused);
-      continue;
-    }
-    const r = await provider.embed(o.fact.content);
-    embedded.set(o, { vector: r.vector, usage: r.usage });
+    if (reused) embedded.set(o, reused);
+    else needsEmbed.push(o);
+  }
+  const fresh = await mapWithConcurrency(needsEmbed, LLM_CONCURRENCY, (o) =>
+    provider.embed(o.fact.content)
+  );
+  for (let i = 0; i < needsEmbed.length; i++) {
+    embedded.set(needsEmbed[i], { vector: fresh[i].vector, usage: fresh[i].usage });
   }
 
   const result: BurstResult = {
@@ -461,35 +491,45 @@ async function processOne(
   const graphJobs = writeTx();
 
   if (GRAPH_ENABLED && graphJobs.length > 0) {
-    for (const job of graphJobs) {
+    // Phase 1: parallel LLM extraction. Phase 2 below walks results in input
+    // order and applies DB writes serially, since entity upserts and the
+    // post-write trigger pass aren't safe to interleave.
+    const llmResults = await mapWithConcurrency(graphJobs, LLM_CONCURRENCY, async (job) => {
       try {
         const graphResult = await provider.extractGraphFromFact(job);
-        const written = writeExtractedGraph(db, job, graphResult.graph);
-        logProcessing(db, {
-          burst_id: burst.id,
-          stage: 'graph_extract',
-          model: graphResult.usage.model,
-          tokens_in: graphResult.usage.tokens_in,
-          tokens_out: graphResult.usage.tokens_out,
-        });
-        log(
-          `  burst ${burst.id} GRAPH fact ${job.fact_id}: entities=${written.entities} mentions=${written.mentions} edges=${written.edges}`
-        );
-
-        // Entity-signal trigger: if this fact's graph touches an established
-        // entity via a type-defining predicate, queue a curator run. Cheap
-        // (DB-only) — actual execution is deferred to drainPlannedAgentRuns.
-        const triggered = planTriggeredRunsForFact(db, job.fact_id);
-        if (triggered.length > 0) {
-          log(
-            `  burst ${burst.id} TRIGGER fact ${job.fact_id}: queued curator runs ${triggered.join(',')}`
-          );
-        }
+        return { ok: true as const, job, graphResult };
       } catch (err) {
+        return { ok: false as const, job, err };
+      }
+    });
+    for (const r of llmResults) {
+      if (!r.ok) {
         log(
-          `  burst ${burst.id} GRAPH fact ${job.fact_id} ERROR: ${
-            err instanceof Error ? err.message : err
+          `  burst ${burst.id} GRAPH fact ${r.job.fact_id} ERROR: ${
+            r.err instanceof Error ? r.err.message : r.err
           }`
+        );
+        continue;
+      }
+      const written = writeExtractedGraph(db, r.job, r.graphResult.graph);
+      logProcessing(db, {
+        burst_id: burst.id,
+        stage: 'graph_extract',
+        model: r.graphResult.usage.model,
+        tokens_in: r.graphResult.usage.tokens_in,
+        tokens_out: r.graphResult.usage.tokens_out,
+      });
+      log(
+        `  burst ${burst.id} GRAPH fact ${r.job.fact_id}: entities=${written.entities} mentions=${written.mentions} edges=${written.edges}`
+      );
+
+      // Entity-signal trigger: if this fact's graph touches an established
+      // entity via a type-defining predicate, queue a curator run. Cheap
+      // (DB-only) — actual execution is deferred to drainPlannedAgentRuns.
+      const triggered = planTriggeredRunsForFact(db, r.job.fact_id);
+      if (triggered.length > 0) {
+        log(
+          `  burst ${burst.id} TRIGGER fact ${r.job.fact_id}: queued curator runs ${triggered.join(',')}`
         );
       }
     }
@@ -498,8 +538,12 @@ async function processOne(
   // Thread assignment: one LLM call per subject in this burst attaches each
   // new fact to existing memory_threads or creates new ones. Failures here
   // are logged but don't fail the burst — fact rows are already committed.
-  for (const [subject, newFacts] of newFactsBySubject) {
-    if (newFacts.length === 0) continue;
+  // Subjects are owner-scoped on memory_threads, so per-subject writes don't
+  // conflict across iterations — safe to fully parallelize.
+  const threadAssignTargets = [...newFactsBySubject.entries()].filter(
+    ([, facts]) => facts.length > 0
+  );
+  await mapWithConcurrency(threadAssignTargets, LLM_CONCURRENCY, async ([subject, newFacts]) => {
     try {
       const existing = listMemoryThreads(db, { owner_subject_wa_id: subject });
       const assignmentResult = await provider.assignThreads({
@@ -560,26 +604,34 @@ async function processOne(
         }`
       );
     }
-  }
+  });
 
-  for (const key of affectedClusters) {
+  const clusterKeys = [...affectedClusters].map((key) => {
     const sep = key.indexOf('|');
-    const subject = key.slice(0, sep);
-    const category = key.slice(sep + 1);
-    try {
-      const refreshed = await refreshClusterSummary(db, provider, subject, category, {
-        burstId: burst.id,
-        log,
-      });
-      if (refreshed === 'refreshed') result.clusters_refreshed++;
-      else if (refreshed === 'deleted') result.clusters_deleted++;
-    } catch (err) {
-      log(
-        `  burst ${burst.id} CLUSTER ${subject}/${category} refresh ERROR: ${
-          err instanceof Error ? err.message : err
-        }`
-      );
+    return { subject: key.slice(0, sep), category: key.slice(sep + 1) };
+  });
+  const clusterResults = await mapWithConcurrency(
+    clusterKeys,
+    LLM_CONCURRENCY,
+    async ({ subject, category }) => {
+      try {
+        return await refreshClusterSummary(db, provider, subject, category, {
+          burstId: burst.id,
+          log,
+        });
+      } catch (err) {
+        log(
+          `  burst ${burst.id} CLUSTER ${subject}/${category} refresh ERROR: ${
+            err instanceof Error ? err.message : err
+          }`
+        );
+        return 'error' as const;
+      }
     }
+  );
+  for (const r of clusterResults) {
+    if (r === 'refreshed') result.clusters_refreshed++;
+    else if (r === 'deleted') result.clusters_deleted++;
   }
 
   return result;
@@ -603,9 +655,13 @@ async function selectExistingByVectorSim(
   burstId: number,
   log: (line: string) => void
 ): Promise<ActiveFactRow[]> {
+  const embeds = await mapWithConcurrency(candidates, LLM_CONCURRENCY, (c) =>
+    provider.embed(c.content)
+  );
   const merged = new Map<number, ActiveFactRow>();
-  for (const c of candidates) {
-    const r = await provider.embed(c.content);
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
+    const r = embeds[i];
     cache.set(c, { vector: r.vector, usage: r.usage });
     logProcessing(db, {
       burst_id: burstId,
