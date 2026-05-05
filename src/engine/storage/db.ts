@@ -27,6 +27,15 @@ export interface FactInput {
   confidence: number;
   /** Unix seconds. Set for event/commitment when burst pinned an unambiguous date. Null otherwise. */
   event_ts?: number | null;
+  /**
+   * Unix seconds. When set, used as the fact's `extracted_at`. Defaults to
+   * Date.now() — but the pipeline passes the source burst's start_ts so the
+   * fact is anchored to *when it was learned in conversation*, not when the
+   * pipeline happened to run. Critical for any retrieval ordering that uses
+   * extracted_at as a temporal anchor (recent_episodes, recency scoring) when
+   * processing offline / reprocessing historic data.
+   */
+  extracted_at?: number;
 }
 
 export interface ProcessingLogInput {
@@ -426,6 +435,7 @@ export function markBurstProcessed(db: DB, burstId: number): void {
 
 export function insertFact(db: DB, fact: FactInput): number {
   const now = Math.floor(Date.now() / 1000);
+  const extractedAt = fact.extracted_at ?? now;
   const result = db
     .prepare(
       `INSERT INTO facts
@@ -439,7 +449,7 @@ export function insertFact(db: DB, fact: FactInput): number {
       fact.category,
       fact.content,
       fact.confidence,
-      now,
+      extractedAt,
       fact.event_ts ?? null
     );
   const factId = Number(result.lastInsertRowid);
@@ -688,6 +698,32 @@ export function listFacts(
   `;
   params.push(limit);
   return db.prepare(sql).all(...params) as FactRow[];
+}
+
+/** Active fact by id, with the same source-joined shape as `listFacts`. */
+export function getActiveFactById(db: DB, factId: number): FactRow | null {
+  const row = db
+    .prepare(
+      `SELECT
+         f.id, f.subject_wa_id, f.category, f.content, f.confidence, f.extracted_at, f.event_ts,
+         f.source_msg_id, f.source_burst_id,
+         COALESCE(rm.body, fbm.body)             AS source_body,
+         COALESCE(rm.ts,   b.start_ts)           AS source_ts,
+         COALESCE(rm.direction, fbm.direction)   AS source_direction
+       FROM facts f
+       LEFT JOIN raw_messages rm ON rm.id = f.source_msg_id
+       LEFT JOIN conversation_bursts b ON b.id = f.source_burst_id
+       LEFT JOIN raw_messages fbm ON fbm.id = (
+         SELECT id FROM raw_messages
+         WHERE burst_id = f.source_burst_id AND body != ''
+         ORDER BY ts ASC, id ASC LIMIT 1
+       )
+       WHERE f.id = ?
+         AND f.superseded_by_id IS NULL
+         AND f.deleted_at IS NULL`
+    )
+    .get(factId) as FactRow | undefined;
+  return row ?? null;
 }
 
 export function searchFactsByVector(

@@ -115,6 +115,7 @@ export {
 // ───────────── inspection / browsing (used by web UI + eval scoring) ─────────────
 export {
   listFacts,
+  getActiveFactById,
   listCategories,
   searchFactsByVector,
   searchFactsForSubjectByVector,

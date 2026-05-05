@@ -12,6 +12,7 @@
     "curator-drain": "tsx scripts/curator-drain.ts",
     "rebuild-graph": "tsx scripts/rebuild-graph.ts",
     "reset-pipeline": "tsx scripts/reset-pipeline.ts",
+    "eval-locomo": "tsx scripts/eval-locomo.ts",
     "web": "tsx src/web/server.ts",
     "typecheck": "tsc --noEmit"
   },
