@@ -11,6 +11,15 @@ export interface BurstInput {
   startTs: number;
   endTs: number;
   lines: BurstLine[];
+  /**
+   * Label for the user's own messages and the subject string used for
+   * first-person facts. Defaults to 'me' (the WhatsApp convention). Eval
+   * harnesses can pass an actual name (e.g. 'Caroline') so extracted facts
+   * are attributed under that name and the chat layer can answer
+   * third-person questions ("What did Caroline say?") without an extra
+   * me↔name bridge.
+   */
+  selfLabel?: string;
 }
 
 export interface FilterResult {
@@ -44,6 +53,13 @@ export interface UsageMetadata {
 export interface ChatInput {
   question: string;
   memoryBlock: string;
+  /**
+   * Answer style. 'conversational' (default) returns prose with [fact:N]
+   * citations; 'factoid' returns the shortest correct phrase with no
+   * citations and "unknown" when memory is silent. Eval harnesses pass
+   * 'factoid' so token-F1 isn't poisoned by citation tokens or filler.
+   */
+  style?: 'conversational' | 'factoid';
 }
 
 export type EmbedMode = 'document' | 'query';

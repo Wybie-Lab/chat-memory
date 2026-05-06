@@ -36,6 +36,13 @@ export interface ProcessOptions {
   log?: (line: string) => void;
   /** For eval: ignore the BURST_GAP_SECONDS settling cutoff. */
   includeUnsettledBursts?: boolean;
+  /**
+   * For eval: override the literal subject string used for the user's own
+   * messages (default 'me'). When set, first-person facts will be
+   * attributed to this name in the DB and the chat layer can answer
+   * third-person questions using that name directly.
+   */
+  selfLabel?: string;
 }
 
 export interface ProcessStats {
@@ -110,7 +117,7 @@ export async function processBatch(
 
   for (const burst of bursts) {
     try {
-      const result = await processOne(db, provider, burst, log);
+      const result = await processOne(db, provider, burst, log, opts.selfLabel);
       if (result === null) {
         stats.bursts_dropped++;
       } else {
@@ -140,7 +147,8 @@ async function processOne(
   db: DB,
   provider: LLMProvider,
   burst: UnprocessedBurst,
-  log: (line: string) => void
+  log: (line: string) => void,
+  selfLabel?: string
 ): Promise<BurstResult | null> {
   const messages = getBurstMessages(db, burst.id);
   if (messages.length === 0) {
@@ -157,6 +165,7 @@ async function processOne(
     startTs: burst.start_ts,
     endTs: burst.end_ts,
     lines: messages.map((m) => ({ direction: m.direction, body: m.body, ts: m.ts })),
+    selfLabel,
   };
 
   const filterResult = await provider.filterBurst(burstInput);
@@ -395,6 +404,7 @@ async function processOne(
           content: o.fact.content,
           confidence: o.fact.confidence,
           event_ts: o.fact.event_ts ?? null,
+          extracted_at: burst.end_ts,
         });
         insertEmbedding(db, factId, e.vector);
         recordNewFact(o.subject, {
@@ -434,6 +444,7 @@ async function processOne(
           content: o.fact.content,
           confidence: o.fact.confidence,
           event_ts: o.fact.event_ts ?? null,
+          extracted_at: burst.end_ts,
         });
         insertEmbedding(db, newId, e.vector);
         recordNewFact(o.subject, {

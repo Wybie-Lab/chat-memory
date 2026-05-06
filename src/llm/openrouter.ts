@@ -61,6 +61,24 @@ Rules:
 
 Return only the answer text — no preamble like "Based on the facts:".`;
 
+const CHAT_FACTOID_PROMPT = `You answer short factual questions using only the structured <memory> block provided.
+
+Output rules:
+- Return the SHORTEST correct phrase that answers the question. A noun phrase, a date, a name, or a list — not a sentence.
+- NO citations like [fact:NN]. NO preamble ("Based on the facts:", "The answer is"). NO follow-up explanation.
+- If <memory> doesn't unambiguously contain the answer, output exactly: unknown
+- Match capitalization to the question's likely expected form (proper nouns capitalized; common nouns lowercase unless they're proper).
+
+Examples:
+Q: What is Caroline's identity?
+A: Transgender woman
+
+Q: What did Caroline research?
+A: Adoption agencies
+
+Q: When did Melanie paint a sunrise?
+A: 2022`;
+
 const FILTER_SYSTEM_PROMPT = `You are a memory curator. Your job is to decide whether a WhatsApp conversation burst — a contiguous run of messages between two people — contains anything worth remembering long-term, as part of building a personal memory layer about the people in someone's life.
 
 A burst is the WHOLE unit of decision: if even ONE message in the burst contains something durable, KEEP the whole burst.
@@ -96,7 +114,14 @@ For each fact you extract, classify it:
 
 Rules:
 - Ground every fact in the literal text of the burst. If you can't quote the supporting words, don't extract the fact.
-- Resolve relative dates ("tomorrow", "next week") using the burst date provided. If a message says "tomorrow" without indicating what's happening, do NOT extract a fact — the date alone is not the fact.
+- ABSOLUTE DATES IN CONTENT (every category, not just events): if the source line uses a relative time ("yesterday", "last week", "last Tuesday", "this morning", "an hour ago", "last year", "next month"), RESOLVE it against the burst date and write the RESOLVED date into the fact's content text — never leave the relative phrase. Use ISO format (YYYY-MM-DD), or year-only when only the year is determinable.
+  Examples (burst date = 2023-05-08):
+    Source "I went to support group yesterday" → content "Caroline went to the LGBTQ support group on 2023-05-07"  ✓
+    Source "I painted a sunrise last year" (burst date 2023-04-12) → content "Melanie painted a lake sunrise in 2022"  ✓
+    Source "we did pottery last Tuesday" → content "...on 2023-05-02 (Tuesday)"  ✓
+    Source "she joined the club last Tuesday" → content "Caroline joined the activist group on 2023-05-02"  — NOT "...last Tuesday"
+  If the relative phrase can't be resolved unambiguously ("a while ago", "when I get back"), drop the time reference from the content rather than guessing — but still extract the fact.
+- If a message says "tomorrow" without indicating what's happening, do NOT extract a fact — the date alone is not the fact.
 - Treat colloquialisms, idioms, sarcasm, and dialect phrases as expressive language, not literal facts.
 - SUBJECT ATTRIBUTION (critical): each line is labeled with its SENDER. Use the per-line sender to resolve first-person and possessives:
   • First-person ("io", "I", "sono", "I'm", "ho", "I have") → subject is the SENDER OF THAT LINE. So "io sono stanco" sent by me → subject is "me"; sent by the contact → subject is the contact.
@@ -127,15 +152,17 @@ Rules:
 - Each fact should be self-contained (readable without the original burst).
 - Return an empty list if the burst contains no durable, grounded facts.
 
-- TIME ANCHOR (event_ts) — for category 'event' or 'commitment' ONLY. If the burst contains an unambiguous specific calendar date for when the event takes place / the commitment is due, return event_ts as Unix seconds (UTC midnight is fine if only the date is known; pick the message-time hour if a specific clock time was given). The burst date is provided to you — use it to anchor relative phrases like "tomorrow", "next Tuesday", "this Sunday" only when the day is unambiguously determinable.
-  Return event_ts ONLY when:
+- TIME ANCHOR (event_ts) — set whenever the fact references a specific calendar date, regardless of category. event/commitment use it for the date the event happens / the commitment is due; 'fact' category uses it for the date the fact pertains to ("Melanie painted a sunrise in 2022" → event_ts = 2022-01-01 UTC midnight).
+  Return event_ts as Unix seconds (UTC midnight is fine if only the date or year is known; pick the message-time hour if a specific clock time was given).
+  Return event_ts when:
     - the date is fully specified (year + month + day), OR
-    - a relative phrase resolves to a specific day given the burst date (e.g. "tomorrow" → burst_date + 1d; "next Tuesday" → the upcoming Tuesday).
-  OMIT event_ts (return null or leave the field out) when:
-    - the date is partial ("in the summer", "later this year", "next month"),
-    - the date is ambiguous ("when she gets back", "after the project"),
-    - the event has no date at all (durable facts about a person's life).
-  Wrong dates are worse than missing dates. Be conservative.
+    - a relative phrase resolves to a specific day given the burst date ("tomorrow" → burst_date + 1d; "next Tuesday" → the upcoming Tuesday; "yesterday" → burst_date − 1d), OR
+    - a year is unambiguously determinable ("last year" given a 2023 burst → 2022-01-01).
+  OMIT event_ts when:
+    - the timing is partial AND non-numeric ("in the summer", "later this year"),
+    - the timing is ambiguous ("when she gets back", "after the project"),
+    - the fact has no temporal anchor at all (durable life facts: "lives in Berlin", "is a painter").
+  Wrong dates are worse than missing dates. Be conservative — but absolute dates in the fact's content (above rule) are mandatory whenever resolvable.
 
 Return your output strictly as JSON matching the provided schema.`;
 
@@ -862,9 +889,11 @@ Do not wrap it in markdown.`,
   }
 
   async chat(input: ChatInput) {
+    const systemPrompt =
+      input.style === 'factoid' ? CHAT_FACTOID_PROMPT : CHAT_SYSTEM_PROMPT;
     const result = await callText({
       model: CHAT_MODEL,
-      systemPrompt: CHAT_SYSTEM_PROMPT,
+      systemPrompt,
       userPrompt: formatChatMessage(input),
     });
     return {
@@ -900,12 +929,22 @@ function formatBurstMessage(input: BurstInput, mode: 'filter' | 'extract'): stri
     `Burst span: ${span} UTC (${input.lines.length} messages)`,
   ];
   if (input.isGroup) lines.push('Group chat');
+  const selfLabel = input.selfLabel ?? 'me';
   lines.push('', 'Conversation burst:');
   for (const line of input.lines) {
-    const sender = line.direction === 'out' ? 'me' : contactLabel;
+    const sender = line.direction === 'out' ? selfLabel : contactLabel;
     lines.push(`  ${sender}: ${line.body}`);
   }
   lines.push('');
+  if (selfLabel !== 'me') {
+    // Override the system prompt's "subject is 'me'" convention so first-
+    // person facts get attributed under the actual name. Used by eval
+    // harnesses (e.g. LOCOMO) where the user is a named persona.
+    lines.push(
+      `Note: in this burst the user's name is "${selfLabel}". For first-person facts from "${selfLabel}", use subject="${selfLabel}" (NOT "me").`,
+      ''
+    );
+  }
   if (mode === 'filter') {
     lines.push('Does this burst contain anything worth remembering?');
   } else {
