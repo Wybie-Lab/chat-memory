@@ -1,6 +1,8 @@
 import {
   composeMemoryBlock,
+  mapWithConcurrency,
   processUntilDrained,
+  retrieveAgentic,
   type DB,
 } from '../../engine';
 import type { LLMProvider } from '../../llm/provider';
@@ -17,6 +19,18 @@ export interface RunOptions {
   limit?: number;
   /** Skip questions whose category is in this set (LOCOMO category numbers 1..5). */
   skipCategories?: Set<number>;
+  /** Only run questions in this category set (when set, others are skipped). */
+  onlyCategories?: Set<number>;
+  /** Max in-flight QAs (default: 5). Each QA = 1 embed + 1 chat call. */
+  qaConcurrency?: number;
+  /**
+   * Use the retrieval agent (`retrieveAgentic`) instead of the one-shot
+   * compose+chat path. The agent drives an ai-sdk loop with read tools over
+   * the memory graph; more expensive but can multi-hop.
+   */
+  agentic?: boolean;
+  /** Hard cap on agent tool steps when `agentic=true`. Default 8. */
+  agentMaxSteps?: number;
   /** Per-event log line. */
   log?: (line: string) => void;
 }
@@ -78,34 +92,58 @@ export async function runEvalForSample(
   }
 
   const qaToRun = (opts.limit ? rawQa.slice(0, opts.limit) : rawQa).filter(
-    (q) => !opts.skipCategories?.has(q.category)
+    (q) => {
+      if (opts.skipCategories?.has(q.category)) return false;
+      if (opts.onlyCategories && !opts.onlyCategories.has(q.category)) return false;
+      return true;
+    }
   );
 
-  const results: QaResult[] = [];
-  for (let i = 0; i < qaToRun.length; i++) {
-    const q = qaToRun[i];
-    const composed = await composeMemoryBlock(db, provider, q.question);
-    const chat = await provider.chat({
-      question: q.question,
-      memoryBlock: composed.block,
-      style: 'factoid',
-    });
-    const score = scoreAnswer(chat.answer, q.answer);
+  const concurrency = opts.qaConcurrency ?? 5;
+  let done = 0;
+  const results = await mapWithConcurrency(qaToRun, concurrency, async (q, i) => {
+    let predicted: string;
+    let memoryChars: number;
+    let citationsCount: number;
+    let agentSteps: number | null = null;
+
+    if (opts.agentic) {
+      const agent = await retrieveAgentic(db, provider, q.question, {
+        maxSteps: opts.agentMaxSteps,
+      });
+      predicted = agent.answer;
+      memoryChars = agent.usage.tokens_in + agent.usage.tokens_out;
+      citationsCount = agent.citations.length;
+      agentSteps = agent.steps;
+    } else {
+      const composed = await composeMemoryBlock(db, provider, q.question);
+      const chat = await provider.chat({
+        question: q.question,
+        memoryBlock: composed.block,
+        style: 'factoid',
+      });
+      predicted = chat.answer;
+      memoryChars = composed.block.length;
+      citationsCount = composed.citations.length;
+    }
+    const score = scoreAnswer(predicted, q.answer);
     const result: QaResult = {
       index: i,
       category: q.category,
       question: q.question,
       goldAnswer: String(q.answer),
-      predicted: chat.answer,
+      predicted,
       score,
-      memoryChars: composed.block.length,
-      citations: composed.citations.length,
+      memoryChars,
+      citations: citationsCount,
     };
-    results.push(result);
+    done++;
+    const stepsTag = agentSteps !== null ? ` steps=${agentSteps}` : '';
     log(
-      `[qa ${i + 1}/${qaToRun.length}] cat=${q.category} EM=${score.exactMatch} F1=${score.tokenF1.toFixed(2)} | Q: ${truncate(q.question, 80)} | gold: ${truncate(String(q.answer), 60)} | pred: ${truncate(chat.answer, 80)}`
+      `[qa ${done}/${qaToRun.length}]${stepsTag} cat=${q.category} EM=${score.exactMatch} F1=${score.tokenF1.toFixed(2)} | Q: ${truncate(q.question, 80)} | gold: ${truncate(String(q.answer), 60)} | pred: ${truncate(predicted, 80)}`
     );
-  }
+    return result;
+  });
 
   return {
     sampleId: sample.sampleId,

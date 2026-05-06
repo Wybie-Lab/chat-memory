@@ -2809,3 +2809,297 @@ export function latestInChain(db: DB, factId: number): number {
   }
   return current;
 }
+
+// ───────────── retrieval-agent helpers (read-only, optimized for an agent
+// loop that drills down by structure: subject → category → facts/entities →
+// chains → graph) ─────────────
+
+export interface CategoryCount {
+  category: string;
+  count: number;
+  latest_extracted_at: number | null;
+  latest_event_ts: number | null;
+}
+
+/**
+ * Per-category active fact count for one subject. Used as the entry point
+ * for the retrieval agent: one cheap call to see the landscape before
+ * deciding which slice to drill into.
+ */
+export function factCountsByCategoryForSubject(
+  db: DB,
+  subjectWaId: string
+): CategoryCount[] {
+  return db
+    .prepare(
+      `SELECT
+         category,
+         COUNT(*)            AS count,
+         MAX(extracted_at)   AS latest_extracted_at,
+         MAX(event_ts)       AS latest_event_ts
+       FROM facts
+       WHERE subject_wa_id = ?
+         AND superseded_by_id IS NULL
+         AND deleted_at IS NULL
+       GROUP BY category
+       ORDER BY count DESC`
+    )
+    .all(subjectWaId) as CategoryCount[];
+}
+
+export interface FactsByCategoryFilters {
+  /** Default 50. Cap at 200 to keep tool results bounded. */
+  limit?: number;
+  /** Optional time window (Unix s). Filters on COALESCE(event_ts, extracted_at). */
+  sinceTs?: number;
+  untilTs?: number;
+}
+
+/**
+ * Active facts for one (subject, category), ordered most-recent-first by
+ * temporal anchor (event_ts when set, otherwise extracted_at). Time window
+ * is optional; both endpoints are inclusive.
+ */
+export function factsByCategoryForSubject(
+  db: DB,
+  subjectWaId: string,
+  category: string,
+  filters: FactsByCategoryFilters = {}
+): ActiveFactRow[] {
+  const where: string[] = [
+    'f.subject_wa_id = ?',
+    'f.category = ?',
+    'f.superseded_by_id IS NULL',
+    'f.deleted_at IS NULL',
+  ];
+  const params: unknown[] = [subjectWaId, category];
+  if (filters.sinceTs !== undefined) {
+    where.push('COALESCE(f.event_ts, f.extracted_at) >= ?');
+    params.push(filters.sinceTs);
+  }
+  if (filters.untilTs !== undefined) {
+    where.push('COALESCE(f.event_ts, f.extracted_at) <= ?');
+    params.push(filters.untilTs);
+  }
+  const limit = Math.min(filters.limit ?? 50, 200);
+  params.push(limit);
+  return db
+    .prepare(
+      `SELECT id, subject_wa_id, category, content, confidence, extracted_at, event_ts
+       FROM facts f
+       WHERE ${where.join(' AND ')}
+       ORDER BY COALESCE(event_ts, extracted_at) DESC, id DESC
+       LIMIT ?`
+    )
+    .all(...params) as ActiveFactRow[];
+}
+
+export interface SearchFactsHybridFilters {
+  subjectWaId?: string;
+  category?: string;
+  /** Inclusive Unix-second time window over COALESCE(event_ts, extracted_at). */
+  sinceTs?: number;
+  untilTs?: number;
+  /** Final result count. Default 12, max 30. */
+  k?: number;
+  /** Vec0 over-fetch — large enough to survive filtering. Default 200. */
+  overFetch?: number;
+}
+
+/**
+ * Vector search with structural filters layered on top. The vec0 MATCH
+ * pre-fetches `overFetch` candidates, then SQL filters narrow to the
+ * requested subject / category / time window. Returns at most `k`.
+ *
+ * If filters are very restrictive against a small DB, the over-fetched
+ * pool may not contain enough hits — caller should fall back to a
+ * non-vector list query in that case.
+ */
+export function searchFactsHybrid(
+  db: DB,
+  vector: number[],
+  filters: SearchFactsHybridFilters = {}
+): FactSearchResult[] {
+  const buf = Buffer.from(new Float32Array(vector).buffer);
+  const k = Math.min(filters.k ?? 12, 30);
+  const overFetch = filters.overFetch ?? 200;
+
+  const where: string[] = [
+    'fe.embedding MATCH ?',
+    'k = ?',
+    'f.superseded_by_id IS NULL',
+    'f.deleted_at IS NULL',
+  ];
+  const params: unknown[] = [buf, overFetch];
+  if (filters.subjectWaId !== undefined) {
+    where.push('f.subject_wa_id = ?');
+    params.push(filters.subjectWaId);
+  }
+  if (filters.category !== undefined) {
+    where.push('f.category = ?');
+    params.push(filters.category);
+  }
+  if (filters.sinceTs !== undefined) {
+    where.push('COALESCE(f.event_ts, f.extracted_at) >= ?');
+    params.push(filters.sinceTs);
+  }
+  if (filters.untilTs !== undefined) {
+    where.push('COALESCE(f.event_ts, f.extracted_at) <= ?');
+    params.push(filters.untilTs);
+  }
+
+  return db
+    .prepare(
+      `SELECT
+         fe.fact_id AS id,
+         fe.distance AS distance,
+         f.subject_wa_id, f.category, f.content, f.confidence, f.extracted_at, f.event_ts,
+         f.source_msg_id, f.source_burst_id,
+         COALESCE(rm.body, fbm.body)             AS source_body,
+         COALESCE(rm.ts,   b.start_ts)           AS source_ts,
+         COALESCE(rm.direction, fbm.direction)   AS source_direction
+       FROM fact_embeddings fe
+       JOIN facts f ON f.id = fe.fact_id
+       LEFT JOIN raw_messages rm ON rm.id = f.source_msg_id
+       LEFT JOIN conversation_bursts b ON b.id = f.source_burst_id
+       LEFT JOIN raw_messages fbm ON fbm.id = (
+         SELECT id FROM raw_messages
+         WHERE burst_id = f.source_burst_id AND body != ''
+         ORDER BY ts ASC, id ASC LIMIT 1
+       )
+       WHERE ${where.join(' AND ')}
+       ORDER BY fe.distance
+       LIMIT ?`
+    )
+    .all(...params, k) as FactSearchResult[];
+}
+
+/**
+ * "What was the (subject, category) state as of time `ts`?"
+ *
+ * Returns active facts whose `extracted_at` is ≤ ts AND which have NOT been
+ * updated by a fact whose `extracted_at` is also ≤ ts. Stale leaves (where
+ * the chain advances past ts) are filtered out. Forks return both branches.
+ *
+ * This is the chain-aware time-travel primitive the agent uses for
+ * "where did Caroline live in March 2023" type questions.
+ */
+export function factsActiveAtTime(
+  db: DB,
+  subjectWaId: string,
+  category: string,
+  ts: number
+): ActiveFactRow[] {
+  return db
+    .prepare(
+      `SELECT id, subject_wa_id, category, content, confidence, extracted_at, event_ts
+       FROM facts f
+       WHERE f.subject_wa_id = ?
+         AND f.category = ?
+         AND f.extracted_at <= ?
+         AND f.superseded_by_id IS NULL
+         AND f.deleted_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM fact_connections fc
+           JOIN facts updater ON updater.id = fc.from_fact_id
+           WHERE fc.to_fact_id = f.id
+             AND fc.predicate IN ('update', 'state_change')
+             AND updater.extracted_at <= ?
+             AND updater.superseded_by_id IS NULL
+             AND updater.deleted_at IS NULL
+         )
+       ORDER BY COALESCE(event_ts, extracted_at) DESC`
+    )
+    .all(subjectWaId, category, ts, ts) as ActiveFactRow[];
+}
+
+export interface EventsInWindowFilters {
+  subjectWaId?: string;
+  /** Default ['event','commitment']. */
+  categories?: string[];
+  limit?: number;
+}
+
+/**
+ * Generalized version of recentEpisodes — facts in the [since, until]
+ * window, optionally filtered by subject and categories. Used for
+ * "what happened between dates X and Y" agent queries.
+ */
+export function eventsInWindow(
+  db: DB,
+  sinceTs: number,
+  untilTs: number,
+  filters: EventsInWindowFilters = {}
+): ActiveFactRow[] {
+  const categories = filters.categories ?? ['event', 'commitment'];
+  const limit = Math.min(filters.limit ?? 50, 200);
+  const where: string[] = [
+    'superseded_by_id IS NULL',
+    'deleted_at IS NULL',
+    `category IN (${categories.map(() => '?').join(',')})`,
+    'COALESCE(event_ts, extracted_at) BETWEEN ? AND ?',
+  ];
+  const params: unknown[] = [...categories, sinceTs, untilTs];
+  if (filters.subjectWaId !== undefined) {
+    where.push('subject_wa_id = ?');
+    params.push(filters.subjectWaId);
+  }
+  params.push(limit);
+  return db
+    .prepare(
+      `SELECT id, subject_wa_id, category, content, confidence, extracted_at, event_ts
+       FROM facts
+       WHERE ${where.join(' AND ')}
+       ORDER BY COALESCE(event_ts, extracted_at) DESC
+       LIMIT ?`
+    )
+    .all(...params) as ActiveFactRow[];
+}
+
+export interface FactEntityRow {
+  entity_id: number;
+  display_name: string;
+  entity_type: string;
+  /** How many of the input facts mention this entity. */
+  mention_count: number;
+  /** Distinct roles ('subject', 'object', 'place', …) in which it's mentioned. */
+  roles: string[];
+}
+
+/**
+ * Pivot from a result-set of facts into the graph: which entities those
+ * facts mention, and how often. Lets the agent ask "of the 8 facts I just
+ * surfaced, what graph entities are involved?" before deciding whether to
+ * traverse.
+ *
+ * Returns empty if the graph wasn't built for this DB.
+ */
+export function entitiesForFacts(db: DB, factIds: number[]): FactEntityRow[] {
+  if (factIds.length === 0) return [];
+  const placeholders = factIds.map(() => '?').join(',');
+  const rows = db
+    .prepare(
+      `SELECT
+         e.id           AS entity_id,
+         e.display_name AS display_name,
+         e.entity_type  AS entity_type,
+         COUNT(*)       AS mention_count,
+         GROUP_CONCAT(DISTINCT m.role) AS roles_csv
+       FROM fact_entity_mentions m
+       JOIN entities e ON e.id = m.entity_id
+       WHERE m.fact_id IN (${placeholders})
+         AND e.merged_into_id IS NULL
+       GROUP BY e.id, e.display_name, e.entity_type
+       ORDER BY mention_count DESC, e.id ASC`
+    )
+    .all(...factIds) as Array<
+    Omit<FactEntityRow, 'roles'> & { roles_csv: string | null }
+  >;
+  return rows.map((r) => ({
+    entity_id: r.entity_id,
+    display_name: r.display_name,
+    entity_type: r.entity_type,
+    mention_count: r.mention_count,
+    roles: r.roles_csv ? r.roles_csv.split(',') : [],
+  }));
+}

@@ -30,6 +30,9 @@ export {
 // ───────────── pipeline (consumers drain bursts) ─────────────
 export { processBatch, processUntilDrained } from './pipeline';
 
+// ───────────── concurrency utility (shared with consumers) ─────────────
+export { mapWithConcurrency } from './concurrency';
+
 // ───────────── knowledge graph (derived projection over facts) ─────────────
 export {
   writeExtractedGraph,
@@ -88,6 +91,11 @@ export {
   matchSubjectsInQuery,
   DEFAULT_WEIGHTS,
 } from './retrieval/score';
+export {
+  retrieveAgentic,
+  type RetrieveAgenticResult,
+  type RetrieveAgenticOptions,
+} from './agent/retriever';
 
 // ───────────── append-only memory (groups + connections) ─────────────
 // Going forward, fact mutation happens via new fact + typed connection,
@@ -119,6 +127,12 @@ export {
   listCategories,
   searchFactsByVector,
   searchFactsForSubjectByVector,
+  searchFactsHybrid,
+  factCountsByCategoryForSubject,
+  factsByCategoryForSubject,
+  factsActiveAtTime,
+  eventsInWindow,
+  entitiesForFacts,
   allActiveSubjects,
   getSubjectInfo,
   supersededFactsForSubject,
@@ -173,6 +187,11 @@ export type {
   FactSearchResult,
   FactSourceRow,
   FactListFilters,
+  CategoryCount,
+  FactsByCategoryFilters,
+  SearchFactsHybridFilters,
+  EventsInWindowFilters,
+  FactEntityRow,
   ActiveFactRow,
   ClusterSummaryRow,
   GraphEntityInput,

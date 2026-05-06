@@ -15,6 +15,10 @@ interface Args {
   skipProcess: boolean;
   outPath: string | null;
   skipCategories: Set<number>;
+  onlyCategories: Set<number> | null;
+  qaConcurrency: number;
+  agentic: boolean;
+  agentMaxSteps: number;
 }
 
 function parseArgs(): Args {
@@ -36,6 +40,13 @@ function parseArgs(): Args {
   const skipCategories = new Set<number>(
     skipCatsRaw ? skipCatsRaw.split(',').map((s) => Number(s.trim())) : []
   );
+  const onlyCatsRaw = get('--category') ?? get('--only-categories');
+  const onlyCategories = onlyCatsRaw
+    ? new Set<number>(onlyCatsRaw.split(',').map((s) => Number(s.trim())))
+    : null;
+  const qaConcurrency = Number(get('--qa-concurrency') ?? '5');
+  const agentic = has('--agentic');
+  const agentMaxSteps = Number(get('--agent-max-steps') ?? '8');
 
   if (Number.isNaN(sampleIndex) || sampleIndex < 0) {
     console.error('--sample must be a non-negative integer');
@@ -55,6 +66,10 @@ function parseArgs(): Args {
     skipProcess: has('--skip-process'),
     outPath,
     skipCategories,
+    onlyCategories,
+    qaConcurrency,
+    agentic,
+    agentMaxSteps,
   };
 }
 
@@ -95,6 +110,10 @@ async function main() {
     skipProcess: args.skipProcess,
     limit: args.limit ?? undefined,
     skipCategories: args.skipCategories.size > 0 ? args.skipCategories : undefined,
+    onlyCategories: args.onlyCategories ?? undefined,
+    qaConcurrency: args.qaConcurrency,
+    agentic: args.agentic,
+    agentMaxSteps: args.agentMaxSteps,
   });
   const elapsedSec = ((Date.now() - t0) / 1000).toFixed(1);
 
